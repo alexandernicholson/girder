@@ -949,3 +949,229 @@ async fn concurrent_writers_are_serialized_safely() {
         .unwrap();
     assert_eq!(all.len(), 800);
 }
+
+// ---------------------------------------------------------------------------
+// WS4: section-granular cache + targeted read_exact_at I/O
+// ---------------------------------------------------------------------------
+
+/// A bench-shaped record with a controllable payload size (payloads dominate
+/// the on-disk footprint; columns are tiny).
+fn big_record(i: usize, payload_len: usize) -> Record {
+    Record {
+        key: format!("s/{i:08}"),
+        timestamp: i as i64,
+        labels: BTreeMap::from([
+            (
+                "model".to_string(),
+                ["gpt-4o", "claude", "llama"][i % 3].to_string(),
+            ),
+            ("project".to_string(), "prod".to_string()),
+        ]),
+        numerics: BTreeMap::from([("latency_ms".to_string(), (i % 2000) as f64)]),
+        payload: vec![7u8; payload_len],
+    }
+}
+
+/// Sum of all `.gird` segment file sizes across the hot + cold dirs.
+fn on_disk_segment_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    for d in [dir.to_path_buf(), dir.join("cold")] {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".gird") {
+                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// A newest-first descending page comparator matching the engine's default.
+fn ts_desc_key(a: &Record, b: &Record) -> std::cmp::Ordering {
+    b.timestamp
+        .cmp(&a.timestamp)
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+/// A cold `selective` scan reads only the column sections it needs plus the
+/// surviving rows' payloads — never the payload blob. With payloads far larger
+/// than the columns, `bytes_read` stays a small fraction of the on-disk size and
+/// well under the 64 MB budget (the WS4 acceptance target, scaled to run as a
+/// unit test; the 1M number is in `benches/engine.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_selective_reads_only_columns_not_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::EveryN(256);
+    cfg.memtable_max_records = 10_000;
+    cfg.compact_min_segments = 8;
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    let n = 100_000usize;
+    let payload_len = 1200usize; // ~realistic span JSON size
+    for b in 0..n / 500 {
+        let chunk: Vec<Record> = (0..500)
+            .map(|i| big_record(b * 500 + i, payload_len))
+            .collect();
+        engine.put_batch(chunk).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.maintain().await.unwrap();
+
+    let on_disk = on_disk_segment_bytes(dir.path());
+    assert!(
+        on_disk > 100 * 1024 * 1024,
+        "corpus should be >100MB on disk (payloads dominate): {on_disk}"
+    );
+    // Cold: nothing has been read yet (the build/compaction paths don't touch
+    // the query-side counter).
+    assert_eq!(
+        engine.stats().bytes_read,
+        0,
+        "no query reads before the first scan"
+    );
+
+    let spec = QuerySpec {
+        numeric_ranges: vec![("latency_ms".into(), 1995.0, f64::MAX)],
+        limit: 50,
+        ..Default::default()
+    };
+    let hits = engine.scan(&spec).await.unwrap();
+    assert_eq!(hits.len(), 50);
+    assert!(hits.iter().all(|r| r.numerics["latency_ms"] >= 1995.0));
+
+    let read = engine.stats().bytes_read;
+    assert!(read > 0, "the scan must have read the columns");
+    // The payload blob (the bulk of on_disk) was NOT faulted in: reads scale with
+    // columns + survivor payloads, not with the whole file.
+    assert!(
+        read * 4 < on_disk,
+        "cold selective read {read} B of {on_disk} B on disk — payload blob not skipped"
+    );
+    assert!(
+        read < 64 * 1024 * 1024,
+        "cold selective read {read} B exceeds the 64MB budget"
+    );
+}
+
+/// Under a `cache_bytes` far smaller than the working set, scans stay correct
+/// across many segments — sections are evicted and re-read, never all pinned,
+/// which is exactly what keeps resident memory bounded by `cache_bytes`. Results
+/// are checked against a naive newest-wins oracle, and a repeat scan (heavy
+/// eviction/reload churn) still agrees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiny_cache_scans_are_correct_under_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::EveryN(256);
+    cfg.memtable_max_records = 1000;
+    cfg.compact_min_segments = 100_000; // never compact → many small segments
+    cfg.cache_bytes = 128 * 1024; // tiny: one segment's columns don't all fit
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    let n = 20_000usize;
+    let mut oracle: Vec<Record> = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = big_record(i, 256);
+        oracle.push(r.clone());
+        engine.put(r).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    let segs = engine.stats().hot_segments;
+    assert!(segs >= 15, "want many segments to force eviction: {segs}");
+
+    let specs = vec![
+        QuerySpec {
+            labels: vec![("model".into(), "gpt-4o".into())],
+            numeric_ranges: vec![("latency_ms".into(), 1000.0, f64::MAX)],
+            ..Default::default()
+        },
+        QuerySpec {
+            numeric_ranges: vec![("latency_ms".into(), 1998.0, f64::MAX)],
+            ..Default::default()
+        },
+        QuerySpec {
+            key_prefix: Some("s/000001".into()),
+            ..Default::default()
+        },
+    ];
+    for spec in &specs {
+        let mut want: Vec<Record> = oracle.iter().filter(|r| spec.matches(r)).cloned().collect();
+        want.sort_by(ts_desc_key);
+        let got = engine.scan(spec).await.unwrap();
+        assert_eq!(got, want, "spec {spec:?}");
+    }
+    // Repeat the busiest scan: eviction + reload must not corrupt results.
+    let mut want0: Vec<Record> = oracle
+        .iter()
+        .filter(|r| specs[0].matches(r))
+        .cloned()
+        .collect();
+    want0.sort_by(ts_desc_key);
+    assert_eq!(engine.scan(&specs[0]).await.unwrap(), want0);
+    // And the query did real I/O (sections were actually re-read from disk).
+    assert!(engine.stats().bytes_read > 0);
+}
+
+/// A scan reading across hot and cold tiers stays correct while segments are
+/// tiered hot→cold concurrently: the open falls back to the other tier if a
+/// rename lands between the manifest snapshot and the open, and a held fd
+/// survives a rename on unix (WS4 tiering-while-scanning).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_survives_concurrent_tiering() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::EveryN(64);
+    cfg.memtable_max_records = 500;
+    cfg.compact_min_segments = 100_000; // never compact — isolate tiering
+    cfg.hot_ttl_nanos = 0; // every segment is instantly cold-eligible
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = std::sync::Arc::new(Girder::open(cfg).await.unwrap());
+
+    for i in 0..6000usize {
+        engine.put(big_record(i, 300)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    assert!(engine.stats().hot_segments >= 8);
+
+    let spec = QuerySpec {
+        labels: vec![("model".into(), "gpt-4o".into())],
+        ..Default::default()
+    };
+    let expected = engine.scan(&spec).await.unwrap().len();
+    assert!(expected > 0);
+
+    let scanner = {
+        let e = engine.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                let got = e.scan(&spec).await.unwrap();
+                assert_eq!(got.len(), expected, "scan result changed under tiering");
+            }
+        })
+    };
+    let tierer = {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                e.maintain().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    scanner.await.unwrap();
+    tierer.await.unwrap();
+
+    let stats = engine.stats();
+    assert_eq!(
+        stats.hot_segments, 0,
+        "everything tiered to cold: {stats:?}"
+    );
+    assert_eq!(engine.scan(&spec).await.unwrap().len(), expected);
+    // A point get from the cold tier still resolves.
+    assert!(engine.get("s/00000000").await.unwrap().is_some());
+}

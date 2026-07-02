@@ -21,7 +21,7 @@ opaque payload.
      scan ◄── zone-map pruning ◄──────────── Manifest (atomic rename)
        │                                                  ▲
        ▼                                                  │
-  block LRU cache                        compaction (merge+dedupe+TTL)
+ section LRU cache                       compaction (merge+dedupe+TTL)
                                          tiering (hot dir ──age──► cold dir)
 ```
 
@@ -45,7 +45,10 @@ construction, not by lock choreography:
 - **Zone maps**: per-segment time range, key range, label value sets
   (cardinality-capped), numeric min/max — queries skip whole segments without
   touching disk.
-- **Caching**: byte-bounded LRU of decoded segments (hit = no I/O, no decode).
+- **Caching**: byte-bounded LRU of decoded column *sections* keyed by
+  `(segment, section)` — a query reads only the sections it touches (targeted
+  `read_exact_at`, never the payload blob), and `stats.bytes_read` makes the
+  per-query I/O observable. RSS stays bounded by `cache_bytes`.
 - **Compaction**: merges hot segments, newest write wins, enforces retention
   TTL, invalidates cache, deletes dead files.
 - **Disk tiering**: segments older than `hot_ttl` move to a cold directory

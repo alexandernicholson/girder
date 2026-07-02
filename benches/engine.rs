@@ -60,6 +60,20 @@ fn total_segment_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Resident set size (bytes) via `/proc/self/statm`, or 0 if unavailable.
+fn rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
+        .and_then(|pages| pages.parse::<u64>().ok())
+        .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
+
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 fn main() {
     let n: usize = std::env::var("GIRDER_BENCH_N")
         .ok()
@@ -131,18 +145,35 @@ fn main() {
         );
 
         // --- selective (uncorrelated): latency_ms > 1995 (~0.25%) ---
+        // WS4: the *cold* first query must read only the columns it needs plus
+        // the surviving rows' payloads — not the ~GB payload blob. `bytes_read`
+        // makes that observable; target: cold <= 400 ms and <= 64 MB read.
         let selective = QuerySpec {
             numeric_ranges: vec![("latency_ms".into(), 1995.0, f64::MAX)],
             limit: 50,
             ..Default::default()
         };
+        let rss_before = rss_bytes();
+        let reads_before = engine.stats().bytes_read;
         let (cold_dur, _) = {
             let start = Instant::now();
             let h = engine.scan(&selective).await.unwrap().len();
             (start.elapsed(), h)
         };
+        let cold_read = engine.stats().bytes_read - reads_before;
+        let rss_after = rss_bytes();
         let (p50, hits) = warm_p50(7, || runtime_block(&engine, &selective));
-        println!("selective  cold={cold_dur:.2?}  warm_p50={p50:.2?}  ({hits} hits, limit 50)");
+        println!(
+            "selective  cold={cold_dur:.2?} ({:.1} MB read; target <=400ms & <=64MB)  \
+             warm_p50={p50:.2?}  ({hits} hits, limit 50)",
+            mb(cold_read)
+        );
+        println!(
+            "  RSS {:.0} MB → {:.0} MB across the cold selective query (cache_bytes {:.0} MB)",
+            mb(rss_before),
+            mb(rss_after),
+            mb(256 * 1024 * 1024),
+        );
 
         // --- broad (label + numeric): model=gpt-4o & latency_ms > 1000 (~17%) ---
         let broad = QuerySpec {
@@ -216,8 +247,11 @@ fn main() {
 
         let stats = engine.stats();
         println!(
-            "cache: {} hits / {} misses",
-            stats.cache_hits, stats.cache_misses
+            "cache: {} hits / {} misses  ·  total bytes read {:.1} MB  ·  RSS {:.0} MB",
+            stats.cache_hits,
+            stats.cache_misses,
+            mb(stats.bytes_read),
+            mb(rss_bytes()),
         );
     });
 }

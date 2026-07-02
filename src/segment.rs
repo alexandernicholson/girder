@@ -23,10 +23,22 @@
 //!   rmp(SectionDir{count, entries}) · u64 footer_off · u32 footer_crc · u32 magic
 //! ```
 //!
+//! **WS4 — section-granular targeted I/O.** A scan reads only the sections it
+//! touches, one `read_exact_at` per section, and *never* faults in the payload
+//! blob wholesale — payload bytes are sliced per surviving row. The footer's
+//! section directory ([`SegDir`]) is parsed from a tiny tail read; each column
+//! ([`Section`]) is then read + crc-verified individually and cached per
+//! `(segment_id, SectionId)`, so a cold `selective` query reads tens of MB of
+//! columns instead of the ~GB of payloads. Every positioned read funnels
+//! through [`read_at`], which tallies a `bytes_read` counter so per-query I/O is
+//! observable. The payload offset table is read on its own (the first
+//! `8·(count+1)` bytes of the payload section) and structurally validated
+//! without reading — or crc-checking — the raw payload bytes.
+//!
 //! **Format v1 (legacy)** was `[magic][version=1][crc32(body)][rmp(Vec<Record>)]`.
-//! It stays fully readable via a compat shim (`read_columns` decodes it into the
-//! same in-memory column set); the version word dispatches. v1 files are
-//! rewritten to v2 by the first compaction that touches them (WS3).
+//! It stays fully readable via a compat shim (`read_columns` / `read_all_records`
+//! decode it into the same in-memory column set); the version word dispatches.
+//! v1 files are rewritten to v2 by the first compaction that touches them (WS3).
 //!
 //! The zone map is stored in the manifest (not the file), so the manifest
 //! format does not migrate.
@@ -34,6 +46,8 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -180,7 +194,7 @@ fn key_range_overlaps_prefix(min_key: &str, max_key: &str, prefix: &str) -> bool
 
 /// Per-block (≈`BLOCK_ROWS` rows) zone map, embedded in the v2 footer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockMeta {
+pub struct BlockMeta {
     start: u32,
     end: u32, // exclusive
     min_ts: i64,
@@ -194,11 +208,11 @@ struct BlockMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Decoded column set (what the cache holds; payload bytes excluded for v2)
+// Decoded columns (the cacheable sections; payload bytes excluded for v2)
 // ---------------------------------------------------------------------------
 
 /// A decoded label column.
-enum LabelColumn {
+pub enum LabelColumn {
     Dict {
         dict: Vec<String>,
         code_of: HashMap<String, u16>,
@@ -210,30 +224,60 @@ enum LabelColumn {
 }
 
 /// A decoded numeric column: `present[i]` gates `values[i]` (absent → NaN).
-struct NumericColumn {
+pub struct NumericColumn {
     present: Vec<bool>,
     values: Vec<f64>,
 }
 
+/// The decoded key column: concatenated key-sorted utf8 + byte offsets.
+pub struct KeysSection {
+    blob: String,
+    offsets: Vec<u64>, // len count+1
+}
+
+impl KeysSection {
+    #[inline]
+    fn key_at(&self, i: usize) -> &str {
+        &self.blob[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+    fn bytes(&self) -> u64 {
+        self.blob.len() as u64 + (self.offsets.len() as u64) * 8 + 32
+    }
+}
+
+/// The payload offset table (v2). `rel[i]..rel[i+1]` are byte offsets into the
+/// payload blob whose absolute file offset is `abs_base`. Note the raw payload
+/// bytes are *not* held here — they are `read_exact_at` per surviving row.
+pub struct PayloadIndex {
+    abs_base: u64,
+    rel: Vec<u64>,
+}
+
+impl PayloadIndex {
+    fn bytes(&self) -> u64 {
+        (self.rel.len() as u64) * 8 + 32
+    }
+}
+
 /// How row payloads are sourced when materializing a `Record`.
 enum Payloads {
-    /// v2: raw bytes live in the file; `rel[i]..rel[i+1]` are offsets into the
-    /// payload blob whose absolute file offset is `abs_base`.
-    File { abs_base: u64, rel: Vec<u64> },
+    /// v2: raw bytes live in the file; slice `rel[i]..rel[i+1]` at `abs_base`.
+    File(Arc<PayloadIndex>),
     /// v1 compat: owned payload bytes in memory.
-    Mem(Vec<Vec<u8>>),
+    Mem(Arc<Vec<Vec<u8>>>),
 }
 
 /// A segment decoded into typed columns. Filters run over these; payloads are
-/// sliced only for surviving rows. Cheaply cloneable via `Arc` in the cache.
+/// sliced only for surviving rows. Each column is an `Arc` shared with the
+/// section cache (WS4), so assembling a view for a scan is cheap and the same
+/// decoded bytes are never held twice.
 pub struct SegmentColumns {
     count: usize,
-    keys: String,          // concatenated, key-sorted
-    key_offsets: Vec<u64>, // len count+1, byte offsets into `keys`
-    timestamps: Vec<i64>,
-    labels: BTreeMap<String, LabelColumn>,
-    numerics: BTreeMap<String, NumericColumn>,
-    blocks: Vec<BlockMeta>,
+    keys: Arc<KeysSection>,
+    timestamps: Arc<Vec<i64>>,
+    labels: BTreeMap<String, Arc<LabelColumn>>,
+    numerics: BTreeMap<String, Arc<NumericColumn>>,
+    blocks: Arc<Vec<BlockMeta>>,
     payloads: Payloads,
 }
 
@@ -244,7 +288,7 @@ impl SegmentColumns {
 
     #[inline]
     pub fn key_at(&self, i: usize) -> &str {
-        &self.keys[self.key_offsets[i] as usize..self.key_offsets[i + 1] as usize]
+        self.keys.key_at(i)
     }
 
     /// Timestamp of row `i` (for order-by / early-termination bounds).
@@ -265,7 +309,7 @@ impl SegmentColumns {
 
     /// True if materializing a row needs the segment file open (v2 payloads).
     pub fn payload_needs_file(&self) -> bool {
-        matches!(self.payloads, Payloads::File { .. })
+        matches!(self.payloads, Payloads::File(_))
     }
 
     /// Binary search the (sorted) key column.
@@ -283,32 +327,20 @@ impl SegmentColumns {
         None
     }
 
-    /// Estimated in-memory footprint, for cache accounting.
+    /// Estimated in-memory footprint of the whole column set. Used only for v1
+    /// (whole-bundle) cache accounting; v2 accounts each `Section` separately.
     pub fn heap_bytes(&self) -> u64 {
-        let mut n = self.keys.len() as u64 + (self.key_offsets.len() as u64) * 8;
-        n += (self.timestamps.len() as u64) * 8;
+        let mut n = self.keys.bytes() + (self.timestamps.len() as u64) * 8;
         for col in self.labels.values() {
-            match col {
-                LabelColumn::Dict { dict, codes, .. } => {
-                    n += (codes.len() as u64) * 2;
-                    for s in dict {
-                        n += s.len() as u64 + 24;
-                    }
-                }
-                LabelColumn::Plain { values } => {
-                    for v in values {
-                        n += v.as_ref().map(|s| s.len() as u64 + 24).unwrap_or(8);
-                    }
-                }
-            }
+            n += label_bytes(col);
         }
         for col in self.numerics.values() {
-            n += col.present.len() as u64 + (col.values.len() as u64) * 8;
+            n += numeric_bytes(col);
         }
         match &self.payloads {
-            Payloads::File { rel, .. } => n += (rel.len() as u64) * 8,
+            Payloads::File(pi) => n += pi.bytes(),
             Payloads::Mem(v) => {
-                for p in v {
+                for p in v.iter() {
                     n += p.len() as u64 + 24;
                 }
             }
@@ -331,18 +363,20 @@ impl SegmentColumns {
         for (name, val) in &spec.labels {
             match self.labels.get(name) {
                 None => return Vec::new(),
-                Some(LabelColumn::Dict { code_of, codes, .. }) => match code_of.get(val) {
-                    Some(&c) => {
-                        lreqs.push(LReq::Code(codes, c));
-                        if c <= BLOCK_BITSET_CODES {
-                            dict_prune.push((name.as_str(), c));
+                Some(col) => match col.as_ref() {
+                    LabelColumn::Dict { code_of, codes, .. } => match code_of.get(val) {
+                        Some(&c) => {
+                            lreqs.push(LReq::Code(codes.as_slice(), c));
+                            if c <= BLOCK_BITSET_CODES {
+                                dict_prune.push((name.as_str(), c));
+                            }
                         }
+                        None => return Vec::new(),
+                    },
+                    LabelColumn::Plain { values } => {
+                        lreqs.push(LReq::Plain(values.as_slice(), val.as_str()))
                     }
-                    None => return Vec::new(),
                 },
-                Some(LabelColumn::Plain { values }) => {
-                    lreqs.push(LReq::Plain(values, val.as_str()))
-                }
             }
         }
         let mut nreqs: Vec<(&NumericColumn, f64, f64)> =
@@ -350,14 +384,14 @@ impl SegmentColumns {
         for (name, lo, hi) in &spec.numeric_ranges {
             match self.numerics.get(name) {
                 None => return Vec::new(),
-                Some(nc) => nreqs.push((nc, *lo, *hi)),
+                Some(nc) => nreqs.push((nc.as_ref(), *lo, *hi)),
             }
         }
         let prefix = spec.key_prefix.as_deref();
         let time = spec.time;
 
         let mut out: Vec<u32> = Vec::new();
-        for block in &self.blocks {
+        for block in self.blocks.iter() {
             if !self.block_may_match(block, spec, &dict_prune) {
                 continue;
             }
@@ -429,15 +463,21 @@ impl SegmentColumns {
     }
 
     /// Reconstruct a full `Record` for row `i`. `file` must be `Some` (the open
-    /// segment file) when `payload_needs_file()` is true.
-    pub fn materialize(&self, i: usize, file: Option<&File>) -> Result<Record> {
+    /// segment file) when `payload_needs_file()` is true. Any payload read is
+    /// tallied into `bytes_read` (WS4 per-query I/O accounting).
+    pub fn materialize(
+        &self,
+        i: usize,
+        file: Option<&File>,
+        bytes_read: &AtomicU64,
+    ) -> Result<Record> {
         let payload = match &self.payloads {
             Payloads::Mem(v) => v[i].clone(),
-            Payloads::File { abs_base, rel } => {
+            Payloads::File(pi) => {
                 let f = file.ok_or_else(|| corrupt("payload file handle missing"))?;
-                let off = abs_base + rel[i];
-                let len = (rel[i + 1] - rel[i]) as usize;
-                read_at(f, off, len)?
+                let off = pi.abs_base + pi.rel[i];
+                let len = (pi.rel[i + 1] - pi.rel[i]) as usize;
+                read_at(f, off, len, bytes_read)?
             }
         };
         Ok(self.build_record(i, payload))
@@ -446,7 +486,7 @@ impl SegmentColumns {
     fn build_record(&self, i: usize, payload: Vec<u8>) -> Record {
         let mut labels = BTreeMap::new();
         for (name, col) in &self.labels {
-            match col {
+            match col.as_ref() {
                 LabelColumn::Dict { dict, codes, .. } => {
                     let c = codes[i];
                     if c != 0 {
@@ -478,12 +518,12 @@ impl SegmentColumns {
     /// v1-compat / in-memory constructor: build columns from decoded records.
     pub fn from_records(records: Vec<Record>) -> SegmentColumns {
         let count = records.len();
-        let mut keys = String::new();
-        let mut key_offsets = Vec::with_capacity(count + 1);
-        key_offsets.push(0u64);
+        let mut blob = String::new();
+        let mut offsets = Vec::with_capacity(count + 1);
+        offsets.push(0u64);
         for r in &records {
-            keys.push_str(&r.key);
-            key_offsets.push(keys.len() as u64);
+            blob.push_str(&r.key);
+            offsets.push(blob.len() as u64);
         }
         let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp).collect();
 
@@ -511,7 +551,7 @@ impl SegmentColumns {
                     LabelColumn::Plain { values }
                 }
             };
-            labels.insert(plan.name.clone(), col);
+            labels.insert(plan.name.clone(), Arc::new(col));
         }
 
         let mut numerics = BTreeMap::new();
@@ -524,20 +564,128 @@ impl SegmentColumns {
                     values[i] = *v;
                 }
             }
-            numerics.insert(name, NumericColumn { present, values });
+            numerics.insert(name, Arc::new(NumericColumn { present, values }));
         }
 
         let blocks = build_blocks(&records, &plans);
-        let payloads = Payloads::Mem(records.into_iter().map(|r| r.payload).collect());
+        let payloads = Payloads::Mem(Arc::new(records.into_iter().map(|r| r.payload).collect()));
+        SegmentColumns {
+            count,
+            keys: Arc::new(KeysSection { blob, offsets }),
+            timestamps: Arc::new(timestamps),
+            labels,
+            numerics,
+            blocks: Arc::new(blocks),
+            payloads,
+        }
+    }
+
+    /// Assemble a v2 column view from already-decoded (cached) section `Arc`s.
+    /// Used by the engine's section loader once every needed section is in hand.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble(
+        count: usize,
+        keys: Arc<KeysSection>,
+        timestamps: Arc<Vec<i64>>,
+        labels: BTreeMap<String, Arc<LabelColumn>>,
+        numerics: BTreeMap<String, Arc<NumericColumn>>,
+        blocks: Arc<Vec<BlockMeta>>,
+        payload_index: Arc<PayloadIndex>,
+    ) -> SegmentColumns {
         SegmentColumns {
             count,
             keys,
-            key_offsets,
             timestamps,
             labels,
             numerics,
             blocks,
-            payloads,
+            payloads: Payloads::File(payload_index),
+        }
+    }
+}
+
+fn label_bytes(col: &LabelColumn) -> u64 {
+    match col {
+        LabelColumn::Dict { dict, codes, .. } => {
+            let mut n = (codes.len() as u64) * 2;
+            for s in dict {
+                n += s.len() as u64 + 24;
+            }
+            n
+        }
+        LabelColumn::Plain { values } => {
+            let mut n = 0;
+            for v in values {
+                n += v.as_ref().map(|s| s.len() as u64 + 24).unwrap_or(8);
+            }
+            n
+        }
+    }
+}
+
+fn numeric_bytes(col: &NumericColumn) -> u64 {
+    col.present.len() as u64 + (col.values.len() as u64) * 8 + 32
+}
+
+fn block_bytes(blocks: &[BlockMeta]) -> u64 {
+    let mut n = 64;
+    for b in blocks {
+        n += 96 + b.first_key.len() as u64 + b.last_key.len() as u64;
+        n += (b.numerics.len() as u64) * 40;
+        n += (b.label_bitsets.len() as u64) * 40;
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
+// Section cache identity (WS4)
+// ---------------------------------------------------------------------------
+
+/// Identifies one cacheable section of a segment. The cache key is
+/// `(segment_id, SectionId)` — column sections (MBs) are cached individually,
+/// so a tiny `cache_bytes` still evicts predictably and RSS stays bounded.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SectionId {
+    /// The parsed footer directory (or version marker).
+    Dir,
+    Keys,
+    Timestamps,
+    Blocks,
+    PayloadIndex,
+    Label(String),
+    Numeric(String),
+    /// A whole v1 (legacy) segment decoded in memory — v1 is not
+    /// section-structured, so it is cached as one entry.
+    V1Whole,
+}
+
+/// A decoded, cacheable section. Each variant wraps an `Arc` so a cache hit is
+/// a pointer clone shared with the assembled [`SegmentColumns`] view.
+#[derive(Clone)]
+pub enum Section {
+    Dir(Arc<SegDir>),
+    Keys(Arc<KeysSection>),
+    Timestamps(Arc<Vec<i64>>),
+    Blocks(Arc<Vec<BlockMeta>>),
+    PayloadIndex(Arc<PayloadIndex>),
+    Label(Arc<LabelColumn>),
+    Numeric(Arc<NumericColumn>),
+    V1Whole(Arc<SegmentColumns>),
+}
+
+impl Section {
+    /// Estimated in-memory footprint, the single source of truth for cache
+    /// accounting (sized once, on insert).
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Section::Dir(d) => d.bytes(),
+            Section::Keys(k) => k.bytes(),
+            Section::Timestamps(t) => (t.len() as u64) * 8 + 32,
+            Section::Blocks(b) => block_bytes(b),
+            Section::PayloadIndex(p) => p.bytes(),
+            Section::Label(l) => label_bytes(l),
+            Section::Numeric(n) => numeric_bytes(n),
+            Section::V1Whole(c) => c.heap_bytes(),
         }
     }
 }
@@ -1010,6 +1158,18 @@ fn decode_numeric_column(body: &[u8], count: usize) -> Result<NumericColumn> {
     Ok(NumericColumn { present, values })
 }
 
+fn decode_timestamps(body: &[u8], count: usize) -> Result<Vec<i64>> {
+    if body.len() != count * 8 {
+        return Err(corrupt("timestamp column size mismatch"));
+    }
+    let mut c = Cur::new(body);
+    let mut v = Vec::with_capacity(count);
+    for _ in 0..count {
+        v.push(c.i64()?);
+    }
+    Ok(v)
+}
+
 fn slice(bytes: &[u8], from: usize, len: usize) -> Result<&[u8]> {
     let end = from
         .checked_add(len)
@@ -1019,6 +1179,11 @@ fn slice(bytes: &[u8], from: usize, len: usize) -> Result<&[u8]> {
     }
     Ok(&bytes[from..end])
 }
+
+// ---------------------------------------------------------------------------
+// Whole-file decoders (compaction / recovery / tests). These read every byte;
+// scans use the targeted section readers below (WS4).
+// ---------------------------------------------------------------------------
 
 fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
     let len = bytes.len();
@@ -1042,12 +1207,12 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
         rmp_serde::from_slice(dir_body).map_err(|e| corrupt(format!("footer: {e}")))?;
     let count = dir.count as usize;
 
-    let mut keys: Option<(String, Vec<u64>)> = None;
+    let mut keys: Option<KeysSection> = None;
     let mut timestamps: Option<Vec<i64>> = None;
-    let mut labels: BTreeMap<String, LabelColumn> = BTreeMap::new();
-    let mut numerics: BTreeMap<String, NumericColumn> = BTreeMap::new();
+    let mut labels: BTreeMap<String, Arc<LabelColumn>> = BTreeMap::new();
+    let mut numerics: BTreeMap<String, Arc<NumericColumn>> = BTreeMap::new();
     let mut blocks: Option<Vec<BlockMeta>> = None;
-    let mut payloads: Option<Payloads> = None;
+    let mut payloads: Option<Arc<PayloadIndex>> = None;
 
     for e in &dir.entries {
         let start = e.offset as usize;
@@ -1059,23 +1224,19 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
             return Err(corrupt(format!("section crc mismatch (kind {})", e.kind)));
         }
         match e.kind {
-            K_KEYS => keys = Some(decode_strings(body)?),
-            K_TS => {
-                if body.len() != count * 8 {
-                    return Err(corrupt("timestamp column size mismatch"));
-                }
-                let mut c = Cur::new(body);
-                let mut v = Vec::with_capacity(count);
-                for _ in 0..count {
-                    v.push(c.i64()?);
-                }
-                timestamps = Some(v);
+            K_KEYS => {
+                let (blob, offsets) = decode_strings(body)?;
+                keys = Some(KeysSection { blob, offsets });
             }
+            K_TS => timestamps = Some(decode_timestamps(body, count)?),
             K_LABEL => {
-                labels.insert(e.name.clone(), decode_label_column(body, count)?);
+                labels.insert(e.name.clone(), Arc::new(decode_label_column(body, count)?));
             }
             K_NUMERIC => {
-                numerics.insert(e.name.clone(), decode_numeric_column(body, count)?);
+                numerics.insert(
+                    e.name.clone(),
+                    Arc::new(decode_numeric_column(body, count)?),
+                );
             }
             K_PAYLOAD => {
                 let mut c = Cur::new(body);
@@ -1084,7 +1245,7 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
                     rel.push(c.u64()?);
                 }
                 let abs_base = (start + 4 + 8 * (count + 1)) as u64;
-                payloads = Some(Payloads::File { abs_base, rel });
+                payloads = Some(Arc::new(PayloadIndex { abs_base, rel }));
             }
             K_BLOCKS => {
                 blocks =
@@ -1094,22 +1255,21 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
         }
     }
 
-    let (keys, key_offsets) = keys.ok_or_else(|| corrupt("missing key section"))?;
+    let keys = keys.ok_or_else(|| corrupt("missing key section"))?;
     let timestamps = timestamps.ok_or_else(|| corrupt("missing timestamp section"))?;
     let payloads = payloads.ok_or_else(|| corrupt("missing payload section"))?;
     let blocks = blocks.ok_or_else(|| corrupt("missing block index"))?;
-    if key_offsets.len() != count + 1 || timestamps.len() != count {
+    if keys.offsets.len() != count + 1 || timestamps.len() != count {
         return Err(corrupt("column count mismatch"));
     }
     Ok(SegmentColumns {
         count,
-        keys,
-        key_offsets,
-        timestamps,
+        keys: Arc::new(keys),
+        timestamps: Arc::new(timestamps),
         labels,
         numerics,
-        blocks,
-        payloads,
+        blocks: Arc::new(blocks),
+        payloads: Payloads::File(payloads),
     })
 }
 
@@ -1137,9 +1297,10 @@ fn header(bytes: &[u8]) -> Result<(u32, u32)> {
     Ok((magic, version))
 }
 
-/// Read + verify a segment file into typed columns (payloads for v2 are read
-/// lazily from the file). Dispatches on the version word; v1 files are decoded
-/// via the compat shim.
+/// Read + verify a whole segment file into typed columns (payloads for v2 are
+/// still sliced lazily from the file). Whole-file convenience used by the
+/// segment tests; scans use [`read_footer`] + the per-section readers below.
+#[cfg(test)]
 pub fn read_columns(path: &Path) -> Result<SegmentColumns> {
     let bytes = std::fs::read(path)?;
     let (_, version) = header(&bytes)?;
@@ -1159,13 +1320,13 @@ pub fn read_all_records(path: &Path) -> Result<Vec<Record>> {
         VERSION_V1 => decode_v1_records(&bytes),
         VERSION_V2 => {
             let cols = decode_v2_columns(&bytes)?;
-            let Payloads::File { abs_base, rel } = &cols.payloads else {
+            let Payloads::File(pi) = &cols.payloads else {
                 return Err(corrupt("v2 payloads not file-backed"));
             };
             let mut out = Vec::with_capacity(cols.count);
             for i in 0..cols.count {
-                let from = (abs_base + rel[i]) as usize;
-                let plen = (rel[i + 1] - rel[i]) as usize;
+                let from = (pi.abs_base + pi.rel[i]) as usize;
+                let plen = (pi.rel[i + 1] - pi.rel[i]) as usize;
                 let payload = slice(&bytes, from, plen)?.to_vec();
                 out.push(cols.build_record(i, payload));
             }
@@ -1175,9 +1336,63 @@ pub fn read_all_records(path: &Path) -> Result<Vec<Record>> {
     }
 }
 
-/// Read `len` bytes at absolute `offset`. Safe positioned read (no mmap, no
-/// unsafe): `FileExt::read_exact_at` on unix, seek+read fallback elsewhere.
-fn read_at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
+// ---------------------------------------------------------------------------
+// Targeted section reads (WS4): read only the sections a scan touches.
+// ---------------------------------------------------------------------------
+
+/// One entry of the parsed footer directory.
+struct DirEntry {
+    offset: u64, // absolute file offset of the section's crc word
+    len: u64,    // body length (bytes after the crc word)
+    crc: u32,
+}
+
+/// The parsed footer of a v2 segment: what sections exist, where, and their
+/// crc. Small (independent of row count); cached per segment so warm scans
+/// touch no disk. `version` is 1 for a legacy file (no directory).
+pub struct SegDir {
+    count: usize,
+    entries: HashMap<(u8, String), DirEntry>,
+}
+
+impl SegDir {
+    pub fn count(&self) -> usize {
+        self.count
+    }
+    fn entry(&self, kind: u8, name: &str) -> Result<&DirEntry> {
+        self.entries
+            .get(&(kind, name.to_string()))
+            .ok_or_else(|| corrupt(format!("missing section (kind {kind})")))
+    }
+    /// Names of the segment's label columns.
+    pub fn label_names(&self) -> Vec<String> {
+        self.entries
+            .keys()
+            .filter(|(k, _)| *k == K_LABEL)
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+    /// Names of the segment's numeric columns.
+    pub fn numeric_names(&self) -> Vec<String> {
+        self.entries
+            .keys()
+            .filter(|(k, _)| *k == K_NUMERIC)
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+    fn bytes(&self) -> u64 {
+        let mut n = 64;
+        for (_, name) in self.entries.keys() {
+            n += name.len() as u64 + 48;
+        }
+        n
+    }
+}
+
+/// Read `len` bytes at absolute `offset`, tallying `bytes_read`. Safe positioned
+/// read (no mmap, no unsafe): `FileExt::read_exact_at` on unix, seek+read
+/// fallback elsewhere.
+fn read_at(file: &File, offset: u64, len: usize, bytes_read: &AtomicU64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     #[cfg(unix)]
     {
@@ -1191,7 +1406,182 @@ fn read_at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
         f.seek(SeekFrom::Start(offset))?;
         f.read_exact(&mut buf)?;
     }
+    bytes_read.fetch_add(len as u64, Ordering::Relaxed);
     Ok(buf)
+}
+
+/// Read the 8-byte header (magic + version) from an open segment file.
+pub fn read_header(file: &File, bytes_read: &AtomicU64) -> Result<u32> {
+    let h = read_at(file, 0, 8, bytes_read)?;
+    let magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if magic != MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    Ok(version)
+}
+
+/// Parse a v2 segment's footer directory with two small positioned reads (the
+/// 16-byte trailer, then the crc-verified directory body). No column bytes are
+/// read here.
+pub fn read_footer(file: &File, bytes_read: &AtomicU64) -> Result<SegDir> {
+    let len = file.metadata()?.len();
+    if len < 24 {
+        return Err(corrupt("v2 file too short"));
+    }
+    let tail = read_at(file, len - 16, 16, bytes_read)?;
+    let footer_off = u64::from_le_bytes(tail[0..8].try_into().unwrap());
+    let footer_crc = u32::from_le_bytes(tail[8..12].try_into().unwrap());
+    let end_magic = u32::from_le_bytes(tail[12..16].try_into().unwrap());
+    if end_magic != MAGIC {
+        return Err(corrupt("bad trailing magic"));
+    }
+    if footer_off > len - 16 {
+        return Err(corrupt("footer offset out of bounds"));
+    }
+    let dir_body = read_at(
+        file,
+        footer_off,
+        (len - 16 - footer_off) as usize,
+        bytes_read,
+    )?;
+    if crc32fast::hash(&dir_body) != footer_crc {
+        return Err(corrupt("footer crc mismatch"));
+    }
+    let dir: SectionDir =
+        rmp_serde::from_slice(&dir_body).map_err(|e| corrupt(format!("footer: {e}")))?;
+    let mut entries = HashMap::with_capacity(dir.entries.len());
+    for e in dir.entries {
+        entries.insert(
+            (e.kind, e.name),
+            DirEntry {
+                offset: e.offset,
+                len: e.len,
+                crc: e.crc,
+            },
+        );
+    }
+    Ok(SegDir {
+        count: dir.count as usize,
+        entries,
+    })
+}
+
+/// Read + crc-verify one section's body via a single positioned read.
+fn read_verified_body(
+    file: &File,
+    e: &DirEntry,
+    kind: u8,
+    bytes_read: &AtomicU64,
+) -> Result<Vec<u8>> {
+    let total = 4usize
+        .checked_add(e.len as usize)
+        .ok_or_else(|| corrupt("section length overflow"))?;
+    let buf = read_at(file, e.offset, total, bytes_read)?;
+    let inline_crc = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let body = &buf[4..];
+    if inline_crc != e.crc || crc32fast::hash(body) != e.crc {
+        return Err(corrupt(format!("section crc mismatch (kind {kind})")));
+    }
+    Ok(body.to_vec())
+}
+
+/// Load the key column.
+pub fn load_keys(file: &File, dir: &SegDir, bytes_read: &AtomicU64) -> Result<KeysSection> {
+    let e = dir.entry(K_KEYS, "")?;
+    let body = read_verified_body(file, e, K_KEYS, bytes_read)?;
+    let (blob, offsets) = decode_strings(&body)?;
+    if offsets.len() != dir.count + 1 {
+        return Err(corrupt("key column count mismatch"));
+    }
+    Ok(KeysSection { blob, offsets })
+}
+
+/// Load the timestamp column.
+pub fn load_timestamps(file: &File, dir: &SegDir, bytes_read: &AtomicU64) -> Result<Vec<i64>> {
+    let e = dir.entry(K_TS, "")?;
+    let body = read_verified_body(file, e, K_TS, bytes_read)?;
+    decode_timestamps(&body, dir.count)
+}
+
+/// Load the block index.
+pub fn load_blocks(file: &File, dir: &SegDir, bytes_read: &AtomicU64) -> Result<Vec<BlockMeta>> {
+    let e = dir.entry(K_BLOCKS, "")?;
+    let body = read_verified_body(file, e, K_BLOCKS, bytes_read)?;
+    rmp_serde::from_slice(&body).map_err(|e| corrupt(format!("blocks: {e}")))
+}
+
+/// Load one label column.
+pub fn load_label(
+    file: &File,
+    dir: &SegDir,
+    name: &str,
+    bytes_read: &AtomicU64,
+) -> Result<LabelColumn> {
+    let e = dir.entry(K_LABEL, name)?;
+    let body = read_verified_body(file, e, K_LABEL, bytes_read)?;
+    decode_label_column(&body, dir.count)
+}
+
+/// Load one numeric column.
+pub fn load_numeric(
+    file: &File,
+    dir: &SegDir,
+    name: &str,
+    bytes_read: &AtomicU64,
+) -> Result<NumericColumn> {
+    let e = dir.entry(K_NUMERIC, name)?;
+    let body = read_verified_body(file, e, K_NUMERIC, bytes_read)?;
+    decode_numeric_column(&body, dir.count)
+}
+
+/// Load *only* the payload offset table (the first `8·(count+1)` bytes of the
+/// payload section). The raw payload bytes — the ~GB — are never read here and
+/// their crc is not verified (per-row slices are read on demand at materialize
+/// time). The table is instead validated structurally: zero-based, monotonic,
+/// and terminating exactly at the section's raw-byte length.
+pub fn load_payload_index(
+    file: &File,
+    dir: &SegDir,
+    bytes_read: &AtomicU64,
+) -> Result<PayloadIndex> {
+    let e = dir.entry(K_PAYLOAD, "")?;
+    let count = dir.count;
+    let table_len = 8usize
+        .checked_mul(count + 1)
+        .ok_or_else(|| corrupt("payload table overflow"))?;
+    if (e.len as usize) < table_len {
+        return Err(corrupt("payload section shorter than offset table"));
+    }
+    // Offsets start right after the crc word at `e.offset`.
+    let buf = read_at(file, e.offset + 4, table_len, bytes_read)?;
+    let mut c = Cur::new(&buf);
+    let mut rel = Vec::with_capacity(count + 1);
+    for _ in 0..count + 1 {
+        rel.push(c.u64()?);
+    }
+    if rel[0] != 0 {
+        return Err(corrupt("payload offsets not zero-based"));
+    }
+    if rel.windows(2).any(|w| w[0] > w[1]) {
+        return Err(corrupt("payload offsets not monotonic"));
+    }
+    let raw_len = e.len - table_len as u64;
+    if *rel.last().unwrap() != raw_len {
+        return Err(corrupt(
+            "payload offset table inconsistent with section length",
+        ));
+    }
+    let abs_base = e.offset + 4 + table_len as u64;
+    Ok(PayloadIndex { abs_base, rel })
+}
+
+/// Decode a whole v1 (legacy) file into columns from an open handle. v1 is not
+/// section-structured, so the whole file is read (legacy compat only).
+pub fn load_v1_whole(file: &File, bytes_read: &AtomicU64) -> Result<SegmentColumns> {
+    let len = file.metadata()?.len();
+    let bytes = read_at(file, 0, len as usize, bytes_read)?;
+    Ok(SegmentColumns::from_records(decode_v1_records(&bytes)?))
 }
 
 #[cfg(test)]
@@ -1245,6 +1635,55 @@ mod tests {
         assert!(read_all_records(&path).is_err());
     }
 
+    /// WS4: the targeted section readers verify each section's crc and produce
+    /// the same columns as the whole-file decoder, and a corrupt column byte is
+    /// caught on the section read path too.
+    #[test]
+    fn targeted_section_reads_roundtrip_and_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.gird");
+        let mut records = vec![
+            record("a", 1, "gpt-4o", 10.0),
+            record("b", 2, "claude", 20.0),
+            record("c", 3, "gpt-4o", 30.0),
+        ];
+        write_segment(&path, &mut records).unwrap();
+
+        let br = AtomicU64::new(0);
+        let file = File::open(&path).unwrap();
+        assert_eq!(read_header(&file, &br).unwrap(), VERSION_V2);
+        let seg = read_footer(&file, &br).unwrap();
+        assert_eq!(seg.count(), 3);
+
+        let keys = load_keys(&file, &seg, &br).unwrap();
+        assert_eq!(keys.key_at(0), "a");
+        assert_eq!(keys.key_at(2), "c");
+        let ts = load_timestamps(&file, &seg, &br).unwrap();
+        assert_eq!(ts, vec![1, 2, 3]);
+        let lat = load_numeric(&file, &seg, "latency_ms", &br).unwrap();
+        assert_eq!(lat.values, vec![10.0, 20.0, 30.0]);
+        let model = load_label(&file, &seg, "model", &br).unwrap();
+        assert!(matches!(model, LabelColumn::Dict { .. }));
+        let pi = load_payload_index(&file, &seg, &br).unwrap();
+        assert_eq!(pi.rel.len(), 4);
+        let _ = load_blocks(&file, &seg, &br).unwrap();
+
+        // Targeted reads never fault the whole file in.
+        assert!(
+            br.load(Ordering::Relaxed) < std::fs::metadata(&path).unwrap().len(),
+            "section reads should be less than the whole file"
+        );
+
+        // Corrupt the timestamp section body → its crc check fails.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let ts_off = seg.entry(K_TS, "").unwrap().offset as usize;
+        bytes[ts_off + 4] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let file2 = File::open(&path).unwrap();
+        let seg2 = read_footer(&file2, &br).unwrap();
+        assert!(load_timestamps(&file2, &seg2, &br).is_err());
+    }
+
     #[test]
     fn v1_compat_reader() {
         let dir = tempfile::tempdir().unwrap();
@@ -1271,9 +1710,16 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(rows, vec![2]); // only "c" (gpt-4o & latency 30)
-        let rec = cols.materialize(2, None).unwrap();
+        let rec = cols.materialize(2, None, &AtomicU64::new(0)).unwrap();
         assert_eq!(rec.key, "c");
         assert_eq!(rec.payload, b"p-c");
+
+        // load_v1_whole from an open handle agrees.
+        let file = File::open(&path).unwrap();
+        assert_eq!(read_header(&file, &AtomicU64::new(0)).unwrap(), VERSION_V1);
+        let cols2 = load_v1_whole(&file, &AtomicU64::new(0)).unwrap();
+        assert_eq!(cols2.count(), 3);
+        assert_eq!(cols2.key_at(2), "c");
     }
 
     /// WS3: compaction reads mixed v1 + v2 inputs (via `read_all_records`),

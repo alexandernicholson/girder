@@ -14,7 +14,10 @@ use crate::cache::SegmentCache;
 use crate::error::{GirderError, Result};
 use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier};
 use crate::record::{OrderBy, QuerySpec, Record};
-use crate::segment::{self, SegmentColumns};
+use crate::segment::{
+    self, BlockMeta, KeysSection, LabelColumn, NumericColumn, PayloadIndex, Section, SectionId,
+    SegDir, SegmentColumns,
+};
 use crate::wal::{FsyncPolicy, Wal};
 
 #[derive(Debug, Clone)]
@@ -85,6 +88,14 @@ pub struct EngineInner {
     pub stats_bytes_flushed: AtomicU64,
     /// Total bytes written by compaction outputs (numerator for write amp).
     pub stats_bytes_compacted: AtomicU64,
+    /// Segment-level cache hits/misses (one per segment per query — the
+    /// historical zone-map-test semantics). Sourced here, not in the cache,
+    /// because a segment is now assembled from several cached sections.
+    pub stats_cache_hits: AtomicU64,
+    pub stats_cache_misses: AtomicU64,
+    /// Total bytes read from segment files (footer + column sections + per-row
+    /// payload slices). Observable per-query I/O (WS4).
+    pub stats_bytes_read: AtomicU64,
 }
 
 impl EngineInner {
@@ -117,6 +128,10 @@ pub struct Stats {
     /// Cumulative bytes written by compaction outputs. Write amplification is
     /// `bytes_compacted / bytes_flushed`.
     pub bytes_compacted: u64,
+    /// Cumulative bytes read from segment files on the query path — footer,
+    /// column sections, and per-row payload slices (WS4). A cold `selective`
+    /// query stays bounded (tens of MB) instead of faulting in every payload.
+    pub bytes_read: u64,
 }
 
 pub struct Girder {
@@ -171,6 +186,9 @@ impl Girder {
             stats_tiered: AtomicU64::new(0),
             stats_bytes_flushed: AtomicU64::new(0),
             stats_bytes_compacted: AtomicU64::new(0),
+            stats_cache_hits: AtomicU64::new(0),
+            stats_cache_misses: AtomicU64::new(0),
+            stats_bytes_read: AtomicU64::new(0),
             config,
         });
 
@@ -297,10 +315,13 @@ impl Girder {
         };
         // Newest-id first: the first segment that holds the key wins.
         for meta in self.pruned_segments(&spec) {
-            let cols = self.load_columns(&meta)?;
+            let (cols, file) = self.load_segment(&meta)?;
             if let Some(idx) = cols.find_key(key) {
-                let file = self.open_payload_file(&meta, &cols)?;
-                return Ok(Some(cols.materialize(idx, file.as_ref())?));
+                return Ok(Some(cols.materialize(
+                    idx,
+                    file.as_ref(),
+                    &self.inner.stats_bytes_read,
+                )?));
             }
         }
         Ok(None)
@@ -365,14 +386,20 @@ impl Girder {
         let disjoint = key_ranges_disjoint(&metas);
         let last = metas.len().saturating_sub(1);
         for (idx, meta) in metas.iter().enumerate() {
-            let cols = self.load_columns(meta)?;
+            // One open file handle is held across this segment's whole
+            // materialize loop, so a concurrent hot→cold rename can't tear the
+            // per-row payload reads (the fd stays valid on unix).
+            let (cols, file) = self.load_segment(meta)?;
             let rows = cols.matching_rows(spec);
             if !rows.is_empty() {
-                let file = self.open_payload_file(meta, &cols)?;
                 for &row in &rows {
                     let r = row as usize;
                     if !seen.contains(cols.key_at(r)) {
-                        out.push(cols.materialize(r, file.as_ref())?);
+                        out.push(cols.materialize(
+                            r,
+                            file.as_ref(),
+                            &self.inner.stats_bytes_read,
+                        )?);
                     }
                 }
             }
@@ -463,7 +490,9 @@ impl Girder {
                     break; // sound stop — see the doc comment above.
                 }
             }
-            let cols = self.load_columns(meta)?;
+            // Heap phase needs only the columns (keys/ts/order-numeric); the
+            // file handle is reopened lazily for the surviving rows at drain.
+            let (cols, _file) = self.load_segment(meta)?;
             for &row in &cols.matching_rows(spec) {
                 let r = row as usize;
                 let key = cols.key_at(r);
@@ -497,7 +526,7 @@ impl Girder {
                     row,
                 } => {
                     let file = self.open_payload_file(&metas[meta_idx], &cols)?;
-                    out.push(cols.materialize(row, file.as_ref())?);
+                    out.push(cols.materialize(row, file.as_ref(), &self.inner.stats_bytes_read)?);
                 }
             }
         }
@@ -517,28 +546,256 @@ impl Girder {
         metas
     }
 
-    /// Load a segment's decoded column set (cache hit = no I/O, no decode).
-    fn load_columns(
+    /// Assemble a segment's decoded columns from the section cache, reading only
+    /// the sections not already resident (WS4). Returns the assembled view and
+    /// (for v2) the open file handle for per-row payload slicing.
+    ///
+    /// **I/O.** The footer directory and each column section are fetched via
+    /// `read_exact_at`; the ~GB payload blob is never read here — only its
+    /// offset table — so a cold scan reads tens of MB of columns, not the whole
+    /// file. Every read is tallied into `stats_bytes_read`.
+    ///
+    /// **Accounting.** One `cache_misses` bump if *any* section (or the
+    /// directory) had to be read from disk for this segment, else one
+    /// `cache_hits` bump — preserving the historical "first touch of a segment
+    /// in a query counts one miss" semantics that the zone-map tests pin. A
+    /// warm re-scan re-reads payload bytes (never cached) but that is not a
+    /// miss: only column-section loads count.
+    fn load_segment(
         &self,
         meta: &crate::manifest::SegmentMeta,
-    ) -> Result<Arc<segment::SegmentColumns>> {
-        if let Some(cols) = self.inner.cache.get(meta.id) {
-            return Ok(cols);
+    ) -> Result<(Arc<SegmentColumns>, Option<std::fs::File>)> {
+        let id = meta.id;
+        let cache = &self.inner.cache;
+
+        // v1 legacy segments are not section-structured → cached as one bundle.
+        if let Some(Section::V1Whole(cols)) = cache.get(id, SectionId::V1Whole) {
+            self.note_cache_hit();
+            return Ok((cols, None));
         }
-        let path = segment_path(
-            &self.inner.config.hot_dir,
-            &self.inner.config.cold_dir,
-            meta,
-        );
-        let cols = Arc::new(segment::read_columns(&path)?);
+
+        let file = self.open_segment_file(meta)?;
+        let br = &self.inner.stats_bytes_read;
+        let mut disk = false;
+
+        // Directory: cached, or parsed from the footer (v2) / detected as v1.
+        let dir = match cache.get(id, SectionId::Dir) {
+            Some(Section::Dir(d)) => d,
+            _ => {
+                disk = true;
+                match segment::read_header(&file, br)? {
+                    1 => {
+                        let cols = Arc::new(segment::load_v1_whole(&file, br)?);
+                        self.cache_put(id, SectionId::V1Whole, Section::V1Whole(Arc::clone(&cols)));
+                        self.note_cache_miss();
+                        return Ok((cols, None));
+                    }
+                    2 => {
+                        let d = Arc::new(segment::read_footer(&file, br)?);
+                        self.cache_put(id, SectionId::Dir, Section::Dir(Arc::clone(&d)));
+                        d
+                    }
+                    other => {
+                        return Err(GirderError::Corrupt {
+                            what: "segment",
+                            detail: format!("unsupported version {other}"),
+                        })
+                    }
+                }
+            }
+        };
+
+        let count = dir.count();
+        let keys = self.section_keys(id, &dir, &file, &mut disk)?;
+        let timestamps = self.section_timestamps(id, &dir, &file, &mut disk)?;
+        let blocks = self.section_blocks(id, &dir, &file, &mut disk)?;
+        let payload_index = self.section_payload_index(id, &dir, &file, &mut disk)?;
+        let mut labels = BTreeMap::new();
+        for name in dir.label_names() {
+            let col = self.section_label(id, &dir, &file, &name, &mut disk)?;
+            labels.insert(name, col);
+        }
+        let mut numerics = BTreeMap::new();
+        for name in dir.numeric_names() {
+            let col = self.section_numeric(id, &dir, &file, &name, &mut disk)?;
+            numerics.insert(name, col);
+        }
+
+        if disk {
+            self.note_cache_miss();
+        } else {
+            self.note_cache_hit();
+        }
+        let cols = Arc::new(SegmentColumns::assemble(
+            count,
+            keys,
+            timestamps,
+            labels,
+            numerics,
+            blocks,
+            payload_index,
+        ));
+        Ok((cols, Some(file)))
+    }
+
+    fn cache_put(&self, id: u64, section_id: SectionId, section: Section) {
+        let bytes = section.bytes();
+        self.inner.cache.put(id, section_id, section, bytes);
+    }
+    fn note_cache_hit(&self) {
+        self.inner.stats_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    fn note_cache_miss(&self) {
         self.inner
+            .stats_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn section_keys(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Arc<KeysSection>> {
+        if let Some(Section::Keys(k)) = self.inner.cache.get(id, SectionId::Keys) {
+            return Ok(k);
+        }
+        *disk = true;
+        let k = Arc::new(segment::load_keys(file, dir, &self.inner.stats_bytes_read)?);
+        self.cache_put(id, SectionId::Keys, Section::Keys(Arc::clone(&k)));
+        Ok(k)
+    }
+
+    fn section_timestamps(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Arc<Vec<i64>>> {
+        if let Some(Section::Timestamps(t)) = self.inner.cache.get(id, SectionId::Timestamps) {
+            return Ok(t);
+        }
+        *disk = true;
+        let t = Arc::new(segment::load_timestamps(
+            file,
+            dir,
+            &self.inner.stats_bytes_read,
+        )?);
+        self.cache_put(
+            id,
+            SectionId::Timestamps,
+            Section::Timestamps(Arc::clone(&t)),
+        );
+        Ok(t)
+    }
+
+    fn section_blocks(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Arc<Vec<BlockMeta>>> {
+        if let Some(Section::Blocks(b)) = self.inner.cache.get(id, SectionId::Blocks) {
+            return Ok(b);
+        }
+        *disk = true;
+        let b = Arc::new(segment::load_blocks(
+            file,
+            dir,
+            &self.inner.stats_bytes_read,
+        )?);
+        self.cache_put(id, SectionId::Blocks, Section::Blocks(Arc::clone(&b)));
+        Ok(b)
+    }
+
+    fn section_payload_index(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Arc<PayloadIndex>> {
+        if let Some(Section::PayloadIndex(p)) = self.inner.cache.get(id, SectionId::PayloadIndex) {
+            return Ok(p);
+        }
+        *disk = true;
+        let p = Arc::new(segment::load_payload_index(
+            file,
+            dir,
+            &self.inner.stats_bytes_read,
+        )?);
+        self.cache_put(
+            id,
+            SectionId::PayloadIndex,
+            Section::PayloadIndex(Arc::clone(&p)),
+        );
+        Ok(p)
+    }
+
+    fn section_label(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        name: &str,
+        disk: &mut bool,
+    ) -> Result<Arc<LabelColumn>> {
+        if let Some(Section::Label(l)) =
+            self.inner.cache.get(id, SectionId::Label(name.to_string()))
+        {
+            return Ok(l);
+        }
+        *disk = true;
+        let l = Arc::new(segment::load_label(
+            file,
+            dir,
+            name,
+            &self.inner.stats_bytes_read,
+        )?);
+        self.cache_put(
+            id,
+            SectionId::Label(name.to_string()),
+            Section::Label(Arc::clone(&l)),
+        );
+        Ok(l)
+    }
+
+    fn section_numeric(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        name: &str,
+        disk: &mut bool,
+    ) -> Result<Arc<NumericColumn>> {
+        if let Some(Section::Numeric(n)) = self
+            .inner
             .cache
-            .put(meta.id, Arc::clone(&cols), cols.heap_bytes());
-        Ok(cols)
+            .get(id, SectionId::Numeric(name.to_string()))
+        {
+            return Ok(n);
+        }
+        *disk = true;
+        let n = Arc::new(segment::load_numeric(
+            file,
+            dir,
+            name,
+            &self.inner.stats_bytes_read,
+        )?);
+        self.cache_put(
+            id,
+            SectionId::Numeric(name.to_string()),
+            Section::Numeric(Arc::clone(&n)),
+        );
+        Ok(n)
     }
 
     /// Open the segment file for per-row payload slicing, if the column set
     /// needs it (v2). v1-compat columns carry payloads in memory → no file.
+    /// (Used by the top-k drain, which reopens per surviving segment.)
     fn open_payload_file(
         &self,
         meta: &crate::manifest::SegmentMeta,
@@ -547,12 +804,29 @@ impl Girder {
         if !cols.payload_needs_file() {
             return Ok(None);
         }
-        let path = segment_path(
-            &self.inner.config.hot_dir,
-            &self.inner.config.cold_dir,
-            meta,
-        );
-        Ok(Some(std::fs::File::open(path)?))
+        Ok(Some(self.open_segment_file(meta)?))
+    }
+
+    /// Open a segment file, tolerating a concurrent hot↔cold tiering rename: the
+    /// manifest snapshot the scan holds may name the tier the file *was* in, so
+    /// if the primary path is gone we try the other tier before failing. Once
+    /// open, the handle is held for the segment's whole read (sections + payload
+    /// slices), so an fd stays valid across a rename on unix.
+    fn open_segment_file(&self, meta: &crate::manifest::SegmentMeta) -> Result<std::fs::File> {
+        let hot = &self.inner.config.hot_dir;
+        let cold = &self.inner.config.cold_dir;
+        let primary = segment_path(hot, cold, meta);
+        match std::fs::File::open(&primary) {
+            Ok(f) => Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let other = match meta.tier {
+                    Tier::Hot => cold.join(&meta.file),
+                    Tier::Cold => hot.join(&meta.file),
+                };
+                Ok(std::fs::File::open(other)?)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn stats(&self) -> Stats {
@@ -575,10 +849,11 @@ impl Girder {
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),
-            cache_hits: self.inner.cache.hits.load(Ordering::Relaxed),
-            cache_misses: self.inner.cache.misses.load(Ordering::Relaxed),
+            cache_hits: self.inner.stats_cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.inner.stats_cache_misses.load(Ordering::Relaxed),
             bytes_flushed: self.inner.stats_bytes_flushed.load(Ordering::Relaxed),
             bytes_compacted: self.inner.stats_bytes_compacted.load(Ordering::Relaxed),
+            bytes_read: self.inner.stats_bytes_read.load(Ordering::Relaxed),
         }
     }
 

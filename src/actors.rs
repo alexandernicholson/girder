@@ -57,11 +57,8 @@ impl WriterActor {
         drop(memtable);
         let frozen_seq = state.wal_seq;
         state.wal_seq += 1;
-        state.wal = Wal::open(
-            &self.inner.wal_path(state.wal_seq),
-            self.inner.config.fsync,
-        )
-        .map_err(|e| e.to_string())?;
+        state.wal = Wal::open(&self.inner.wal_path(state.wal_seq), self.inner.config.fsync)
+            .map_err(|e| e.to_string())?;
         self.inner
             .frozen
             .write()
@@ -248,7 +245,7 @@ impl MaintenanceActor {
                 &self.inner.config.cold_dir,
                 meta,
             );
-            for record in segment::read_segment(&path)? {
+            for record in segment::read_all_records(&path)? {
                 merged.insert(record.key.clone(), record);
             }
         }

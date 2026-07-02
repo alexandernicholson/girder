@@ -1,13 +1,15 @@
-//! Byte-bounded LRU cache of decoded segments. A hit skips both disk I/O and
-//! msgpack decoding — the warm-read fast path.
+//! Byte-bounded LRU cache of decoded segment *column sets*. A hit skips both
+//! disk I/O and column decoding — the warm-read fast path. Payload bytes are
+//! not cached (they are sliced from the file per surviving row), so a cached
+//! entry is the small typed columns, not the ~GB of decoded payloads.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::record::Record;
+use crate::segment::SegmentColumns;
 
 struct Entry {
-    records: Arc<Vec<Record>>,
+    columns: Arc<SegmentColumns>,
     bytes: u64,
     /// Monotonic recency stamp.
     used: u64,
@@ -32,13 +34,13 @@ impl SegmentCache {
         }
     }
 
-    pub fn get(&self, id: u64) -> Option<Arc<Vec<Record>>> {
+    pub fn get(&self, id: u64) -> Option<Arc<SegmentColumns>> {
         let mut guard = self.inner.lock().unwrap();
         match guard.get_mut(&id) {
             Some(entry) => {
                 entry.used = self.clock.fetch_add(1, Ordering::Relaxed);
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(Arc::clone(&entry.records))
+                Some(Arc::clone(&entry.columns))
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -47,12 +49,12 @@ impl SegmentCache {
         }
     }
 
-    pub fn put(&self, id: u64, records: Arc<Vec<Record>>, bytes: u64) {
+    pub fn put(&self, id: u64, columns: Arc<SegmentColumns>, bytes: u64) {
         let mut guard = self.inner.lock().unwrap();
         guard.insert(
             id,
             Entry {
-                records,
+                columns,
                 bytes,
                 used: self.clock.fetch_add(1, Ordering::Relaxed),
             },
@@ -83,9 +85,10 @@ impl SegmentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::Record;
 
-    fn records(n: usize) -> Arc<Vec<Record>> {
-        Arc::new(
+    fn records(n: usize) -> Arc<SegmentColumns> {
+        Arc::new(SegmentColumns::from_records(
             (0..n)
                 .map(|i| Record {
                     key: format!("k{i}"),
@@ -95,7 +98,7 @@ mod tests {
                     payload: vec![],
                 })
                 .collect(),
-        )
+        ))
     }
 
     #[test]

@@ -195,9 +195,7 @@ impl Girder {
         // so old WALs can be deleted (clean state, no double-accounting).
         if !recovered.is_empty() {
             tracing::info!(records = recovered.len(), "girder: recovering WAL tail");
-            engine
-                .put_batch(recovered.into_values().collect())
-                .await?;
+            engine.put_batch(recovered.into_values().collect()).await?;
             engine.flush().await?;
             for seq in wal_seqs {
                 std::fs::remove_file(engine.inner.wal_path(seq)).ok();
@@ -276,12 +274,12 @@ impl Girder {
             key_prefix: Some(key.to_string()),
             ..Default::default()
         };
-        let metas = self.pruned_segments(&spec);
-        for meta in metas {
-            let records = self.load_segment(&meta)?;
-            // Sorted by key — binary search.
-            if let Ok(idx) = records.binary_search_by(|r| r.key.as_str().cmp(key)) {
-                return Ok(Some(records[idx].clone()));
+        // Newest-id first: the first segment that holds the key wins.
+        for meta in self.pruned_segments(&spec) {
+            let cols = self.load_columns(&meta)?;
+            if let Some(idx) = cols.find_key(key) {
+                let file = self.open_payload_file(&meta, &cols)?;
+                return Ok(Some(cols.materialize(idx, file.as_ref())?));
             }
         }
         Ok(None)
@@ -289,19 +287,22 @@ impl Girder {
 
     /// Scan matching records, newest-first by timestamp. `spec.limit`
     /// truncates after sorting (0 = unlimited).
+    ///
+    /// The segment path is column-native: filters run over typed columns (with
+    /// block-index pruning) and payloads are sliced out only for surviving
+    /// rows. Newest-wins dedupe is preserved — a key present in a newer source
+    /// shadows any older version.
     pub async fn scan(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<Record> = Vec::new();
 
-        // Recency order: memtable → frozen (newest first) → segments (id desc).
+        // Recency order: memtable → frozen (newest first) seed `seen` with all
+        // their keys (matching or not) so they shadow older segment versions.
         {
             let memtable = self.inner.memtable.read().unwrap();
             for record in memtable.values() {
-                if spec.matches(record) && seen.insert(record.key.clone()) {
+                if seen.insert(record.key.clone()) && spec.matches(record) {
                     out.push(record.clone());
-                } else if !spec.matches(record) {
-                    // Still shadows older versions of the same key.
-                    seen.insert(record.key.clone());
                 }
             }
         }
@@ -315,14 +316,32 @@ impl Girder {
                 }
             }
         }
-        for meta in self.pruned_segments(spec) {
-            let records = self.load_segment(&meta)?;
-            for record in records.iter() {
-                if spec.matches(record) && !seen.contains(&record.key) {
-                    seen.insert(record.key.clone());
-                    out.push(record.clone());
-                } else if !spec.matches(record) {
-                    seen.insert(record.key.clone());
+
+        // Segments, newest-id first. If their key ranges are pairwise disjoint
+        // (the compacted / append-only common case) a key can live in at most
+        // one segment, so no cross-segment shadow tracking is needed — only
+        // membership checks against the memtable/frozen seed. Otherwise fall
+        // back to inserting every visited key of each non-final source so a
+        // block-pruned newer version still shadows an older match (correctness
+        // over speed; WS2 removes the clone cost).
+        let metas = self.pruned_segments(spec);
+        let disjoint = key_ranges_disjoint(&metas);
+        let last = metas.len().saturating_sub(1);
+        for (idx, meta) in metas.iter().enumerate() {
+            let cols = self.load_columns(meta)?;
+            let rows = cols.matching_rows(spec);
+            if !rows.is_empty() {
+                let file = self.open_payload_file(meta, &cols)?;
+                for &row in &rows {
+                    let r = row as usize;
+                    if !seen.contains(cols.key_at(r)) {
+                        out.push(cols.materialize(r, file.as_ref())?);
+                    }
+                }
+            }
+            if !disjoint && idx != last {
+                for i in 0..cols.count() {
+                    seen.insert(cols.key_at(i).to_string());
                 }
             }
         }
@@ -338,7 +357,7 @@ impl Girder {
         Ok(out)
     }
 
-    /// Zone-map pruned segment metas, newest first.
+    /// Zone-map pruned segment metas, newest first (highest id first).
     fn pruned_segments(&self, spec: &QuerySpec) -> Vec<crate::manifest::SegmentMeta> {
         let manifest = self.inner.manifest.read().unwrap();
         let mut metas: Vec<_> = manifest
@@ -351,14 +370,42 @@ impl Girder {
         metas
     }
 
-    fn load_segment(&self, meta: &crate::manifest::SegmentMeta) -> Result<Arc<Vec<Record>>> {
-        if let Some(records) = self.inner.cache.get(meta.id) {
-            return Ok(records);
+    /// Load a segment's decoded column set (cache hit = no I/O, no decode).
+    fn load_columns(
+        &self,
+        meta: &crate::manifest::SegmentMeta,
+    ) -> Result<Arc<segment::SegmentColumns>> {
+        if let Some(cols) = self.inner.cache.get(meta.id) {
+            return Ok(cols);
         }
-        let path = segment_path(&self.inner.config.hot_dir, &self.inner.config.cold_dir, meta);
-        let records = Arc::new(segment::read_segment(&path)?);
-        self.inner.cache.put(meta.id, Arc::clone(&records), meta.bytes);
-        Ok(records)
+        let path = segment_path(
+            &self.inner.config.hot_dir,
+            &self.inner.config.cold_dir,
+            meta,
+        );
+        let cols = Arc::new(segment::read_columns(&path)?);
+        self.inner
+            .cache
+            .put(meta.id, Arc::clone(&cols), cols.heap_bytes());
+        Ok(cols)
+    }
+
+    /// Open the segment file for per-row payload slicing, if the column set
+    /// needs it (v2). v1-compat columns carry payloads in memory → no file.
+    fn open_payload_file(
+        &self,
+        meta: &crate::manifest::SegmentMeta,
+        cols: &segment::SegmentColumns,
+    ) -> Result<Option<std::fs::File>> {
+        if !cols.payload_needs_file() {
+            return Ok(None);
+        }
+        let path = segment_path(
+            &self.inner.config.hot_dir,
+            &self.inner.config.cold_dir,
+            meta,
+        );
+        Ok(Some(std::fs::File::open(path)?))
     }
 
     pub fn stats(&self) -> Stats {
@@ -367,8 +414,16 @@ impl Girder {
             puts: self.inner.stats_puts.load(Ordering::Relaxed),
             memtable_records: self.inner.memtable.read().unwrap().len(),
             frozen_memtables: self.inner.frozen.read().unwrap().len(),
-            hot_segments: manifest.segments.iter().filter(|s| s.tier == Tier::Hot).count(),
-            cold_segments: manifest.segments.iter().filter(|s| s.tier == Tier::Cold).count(),
+            hot_segments: manifest
+                .segments
+                .iter()
+                .filter(|s| s.tier == Tier::Hot)
+                .count(),
+            cold_segments: manifest
+                .segments
+                .iter()
+                .filter(|s| s.tier == Tier::Cold)
+                .count(),
             total_records_in_segments: manifest.segments.iter().map(|s| s.zone.count).sum(),
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
@@ -389,4 +444,15 @@ impl Girder {
         self._ticker.abort();
         Ok(())
     }
+}
+
+/// Are the segments' key ranges pairwise disjoint? If so, a key can appear in
+/// at most one segment and cross-segment shadow tracking is unnecessary.
+fn key_ranges_disjoint(metas: &[crate::manifest::SegmentMeta]) -> bool {
+    let mut ranges: Vec<(&str, &str)> = metas
+        .iter()
+        .map(|m| (m.zone.min_key.as_str(), m.zone.max_key.as_str()))
+        .collect();
+    ranges.sort_by(|a, b| a.0.cmp(b.0));
+    ranges.windows(2).all(|w| w[0].1 < w[1].0)
 }

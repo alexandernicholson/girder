@@ -30,10 +30,7 @@ pub struct Wal {
 
 impl Wal {
     pub fn open(path: &Path, policy: FsyncPolicy) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Wal {
             file,
             policy,
@@ -45,8 +42,7 @@ impl Wal {
     pub fn append_batch(&mut self, records: &[Record]) -> Result<()> {
         let mut buf = Vec::with_capacity(records.len() * 256);
         for record in records {
-            let body =
-                rmp_serde::to_vec(record).map_err(|e| GirderError::Encode(e.to_string()))?;
+            let body = rmp_serde::to_vec(record).map_err(|e| GirderError::Encode(e.to_string()))?;
             let crc = crc32fast::hash(&body);
             buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
             buf.extend_from_slice(&crc.to_le_bytes());
@@ -112,7 +108,6 @@ impl Wal {
         }
         Ok(records)
     }
-
 }
 
 #[cfg(test)]

@@ -1,0 +1,30 @@
+[package]
+name = "girder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Alexander Nicholson <alexander.nicholson@tablecheck.com>"]
+repository = "https://github.com/alexandernicholson/girder"
+description = "Embedded, actor-supervised storage engine for trace-shaped data, built on the Rebar runtime: WAL, sorted segments with zone maps, block cache, compaction, hot/cold disk tiering."
+rust-version = "1.90"
+
+[dependencies]
+rebar-core = { git = "https://github.com/alexandernicholson/rebar", rev = "891ac5534140ee5b9eaa9391601859120779424f" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+crc32fast = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

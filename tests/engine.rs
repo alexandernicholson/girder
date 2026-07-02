@@ -643,6 +643,284 @@ async fn early_termination_skips_old_segments() {
     assert_eq!(got_ts, want);
 }
 
+// ---------------------------------------------------------------------------
+// WS3: size-capped time-adjacent tiered compaction + zero-clone flush
+// ---------------------------------------------------------------------------
+
+/// Deterministic xorshift for reproducible pseudo-random corpora.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Compaction splits the merged stream into cap-sized segments (never one
+/// giant), preserves every record (no loss), and — crucially — does NOT
+/// re-merge already-capped ("sealed") segments, so write amplification and the
+/// live segment count stay bounded instead of churning forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiered_compaction_caps_segments_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::Always;
+    cfg.memtable_max_records = 100;
+    cfg.compact_min_segments = 4;
+    cfg.max_segment_records = 250;
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    // 2000 distinct keys across 20 flushed segments (100 each). No rewrites.
+    for seg in 0..20 {
+        for i in 0..100 {
+            let n = seg * 100 + i;
+            engine
+                .put(record(
+                    &format!("k{n:05}"),
+                    n as i64,
+                    "gpt-4o",
+                    (n % 500) as f64,
+                ))
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+    assert_eq!(engine.stats().hot_segments, 20);
+
+    engine.maintain().await.unwrap(); // one tiered compaction pass
+    let stats = engine.stats();
+    assert_eq!(stats.total_records_in_segments, 2000, "no records lost");
+    // 2000 records / cap 250 = 8 segments, NOT one giant merge-all segment.
+    assert_eq!(stats.hot_segments, 8, "{stats:?}");
+
+    // Every record is still queryable exactly once.
+    let all = engine
+        .scan(&QuerySpec {
+            key_prefix: Some("k".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2000);
+
+    // Idempotent: sealed (at-cap) segments are never re-compacted → no churn.
+    let comps = engine.stats().compactions;
+    for _ in 0..3 {
+        engine.maintain().await.unwrap();
+    }
+    assert_eq!(
+        engine.stats().compactions,
+        comps,
+        "at-cap segments must not re-compact (bounded write amplification)"
+    );
+}
+
+/// Compaction invariant: newest-wins dedupe and no lost records hold across
+/// MANY tiered compaction passes with splitting and overlapping (rewritten)
+/// keys, matched against a naive newest-wins oracle over several query shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiered_compaction_preserves_newest_wins_and_no_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::Always;
+    cfg.memtable_max_records = 150;
+    cfg.compact_min_segments = 3;
+    cfg.max_segment_records = 300; // small cap → forces splits during compaction
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    let mut oracle: BTreeMap<String, Record> = BTreeMap::new();
+    let mut state = 0x5EED_1234u64;
+    let mut ts = 0i64;
+    for _ in 0..4000 {
+        ts += 1;
+        let key = format!("k/{:04}", xorshift(&mut state) % 500); // rewrites
+        let model = ["gpt-4o", "claude", "llama"][(xorshift(&mut state) % 3) as usize];
+        let mut labels = BTreeMap::from([("model".to_string(), model.to_string())]);
+        if xorshift(&mut state).is_multiple_of(2) {
+            labels.insert(
+                "region".to_string(),
+                format!("r{}", xorshift(&mut state) % 4),
+            );
+        }
+        let mut numerics = BTreeMap::new();
+        if !xorshift(&mut state).is_multiple_of(5) {
+            numerics.insert(
+                "latency_ms".to_string(),
+                (xorshift(&mut state) % 2000) as f64,
+            );
+        }
+        let rec = Record {
+            key: key.clone(),
+            timestamp: ts,
+            labels,
+            numerics,
+            payload: format!("pl-{key}-{ts}").into_bytes(),
+        };
+        oracle.insert(key, rec.clone());
+        engine.put(rec).await.unwrap();
+        if xorshift(&mut state).is_multiple_of(200) {
+            engine.flush().await.unwrap();
+        }
+        if xorshift(&mut state).is_multiple_of(500) {
+            engine.maintain().await.unwrap(); // force compaction mid-build
+        }
+    }
+    engine.flush().await.unwrap();
+    for _ in 0..4 {
+        engine.maintain().await.unwrap(); // several more compaction passes
+    }
+    assert!(engine.stats().compactions >= 2, "compaction actually ran");
+
+    let specs = vec![
+        QuerySpec::default(),
+        QuerySpec {
+            numeric_ranges: vec![("latency_ms".into(), 1500.0, f64::MAX)],
+            ..Default::default()
+        },
+        QuerySpec {
+            labels: vec![("model".into(), "gpt-4o".into())],
+            numeric_ranges: vec![("latency_ms".into(), 500.0, f64::MAX)],
+            ..Default::default()
+        },
+        QuerySpec {
+            labels: vec![("region".into(), "r2".into())],
+            ..Default::default()
+        },
+        QuerySpec {
+            key_prefix: Some("k/01".into()),
+            ..Default::default()
+        },
+    ];
+    for spec in &specs {
+        let mut expected: Vec<Record> = oracle
+            .values()
+            .filter(|r| spec.matches(r))
+            .cloned()
+            .collect();
+        expected.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        let got = engine.scan(spec).await.unwrap();
+        assert_eq!(got, expected, "spec {spec:?}");
+    }
+}
+
+/// `recent` pruning guaranteed BY CONSTRUCTION: with time-adjacent tiered
+/// compaction forced mid-build, a newest-page (timestamp desc) query touches
+/// only the trailing (newest) segments — not the whole corpus — even though
+/// everything has been compacted and re-split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_pruning_guaranteed_after_tiered_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::Always;
+    cfg.memtable_max_records = 100;
+    cfg.compact_min_segments = 4;
+    cfg.max_segment_records = 250;
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    // Time-correlated keys/timestamps across 3000 records, compacting mid-build.
+    for seg in 0..30 {
+        for i in 0..100 {
+            let n = seg * 100 + i;
+            engine
+                .put(record(&format!("k{n:06}"), n as i64, "gpt-4o", 1.0))
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+        if seg % 5 == 4 {
+            engine.maintain().await.unwrap(); // force tiered compaction mid-build
+        }
+    }
+    engine.maintain().await.unwrap();
+    let stats = engine.stats();
+    assert_eq!(stats.total_records_in_segments, 3000, "no loss");
+    assert!(stats.hot_segments >= 8, "many segments: {stats:?}");
+    assert!(stats.compactions >= 3, "compaction ran repeatedly");
+
+    // Newest page: order_by timestamp desc, limit 50.
+    let before = engine.stats().cache_misses;
+    let spec = QuerySpec {
+        order_by: Some(OrderBy::TimestampDesc),
+        limit: 50,
+        ..Default::default()
+    };
+    let got = engine.scan(&spec).await.unwrap();
+    let loaded = engine.stats().cache_misses - before;
+
+    // Correct page: the 50 newest timestamps, descending.
+    let want: Vec<i64> = (2950..3000).rev().collect();
+    let got_ts: Vec<i64> = got.iter().map(|r| r.timestamp).collect();
+    assert_eq!(got_ts, want);
+    // By construction the suffix-max bound stops the scan after the trailing
+    // segment(s) — a small constant, far below the total segment count.
+    assert!(
+        loaded * 4 <= stats.hot_segments as u64,
+        "recent page loaded {loaded} of {} segments — pruning not by construction",
+        stats.hot_segments
+    );
+}
+
+/// Manifest atomicity: after compaction, the manifest is the sole source of
+/// truth (old input files are garbage). Re-opening the engine reloads only the
+/// manifest's segments and every record survives with newest-wins intact — a
+/// torn compaction would surface here as loss or duplication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_manifest_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let build_cfg = || {
+        let mut cfg = GirderConfig::at(dir.path());
+        cfg.fsync = FsyncPolicy::Always;
+        cfg.memtable_max_records = 100;
+        cfg.compact_min_segments = 3;
+        cfg.max_segment_records = 250;
+        cfg.tick_interval = Duration::from_secs(3600);
+        cfg
+    };
+    let mut oracle: BTreeMap<String, Record> = BTreeMap::new();
+    {
+        let engine = Girder::open(build_cfg()).await.unwrap();
+        let mut state = 0xA11CE99u64;
+        let mut ts = 0i64;
+        for _ in 0..1500 {
+            ts += 1;
+            let key = format!("k{:04}", xorshift(&mut state) % 300); // rewrites
+            let rec = record(&key, ts, "gpt-4o", (xorshift(&mut state) % 100) as f64);
+            oracle.insert(key, rec.clone());
+            engine.put(rec).await.unwrap();
+            if xorshift(&mut state).is_multiple_of(120) {
+                engine.flush().await.unwrap();
+            }
+        }
+        engine.flush().await.unwrap();
+        engine.maintain().await.unwrap();
+        engine.maintain().await.unwrap();
+        assert!(engine.stats().compactions >= 1);
+        // Drop WITHOUT close() — the manifest on disk must already be complete.
+        drop(engine);
+    }
+
+    // Re-open: state comes only from the persisted manifest + segments.
+    let engine = Girder::open(build_cfg()).await.unwrap();
+    let all = engine.scan(&QuerySpec::default()).await.unwrap();
+    let mut expected: Vec<Record> = oracle.values().cloned().collect();
+    expected.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    assert_eq!(all, expected, "manifest reload: no lost/duplicated records");
+    // Spot-check newest-wins for a specific key after reopen.
+    let k = &expected[0].key;
+    assert_eq!(engine.get(k).await.unwrap().unwrap(), expected[0]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writers_are_serialized_safely() {
     let dir = tempfile::tempdir().unwrap();

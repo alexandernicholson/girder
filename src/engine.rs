@@ -30,6 +30,13 @@ pub struct GirderConfig {
     pub cache_bytes: u64,
     /// Compact when at least this many hot segments exist.
     pub compact_min_segments: usize,
+    /// Cap on records per output segment produced by compaction; the merged
+    /// key-sorted stream is split into consecutive segments at this boundary so
+    /// no single segment grows unbounded (WS3 size-capped tiered compaction).
+    pub max_segment_records: usize,
+    /// Cap on the estimated payload+key bytes per compaction output segment
+    /// (splits the merged stream whichever cap trips first).
+    pub max_segment_bytes: u64,
     /// Age (nanos) after which segments move to the cold tier.
     pub hot_ttl_nanos: i64,
     /// Drop records older than this at compaction (None = keep forever).
@@ -48,6 +55,8 @@ impl GirderConfig {
             memtable_max_records: 10_000,
             cache_bytes: 256 * 1024 * 1024,
             compact_min_segments: 8,
+            max_segment_records: 128 * 1024,
+            max_segment_bytes: 256 * 1024 * 1024,
             hot_ttl_nanos: 24 * 3600 * 1_000_000_000,
             retention_nanos: None,
             tick_interval: Duration::from_secs(5),
@@ -72,6 +81,10 @@ pub struct EngineInner {
     pub stats_flushes: AtomicU64,
     pub stats_compactions: AtomicU64,
     pub stats_tiered: AtomicU64,
+    /// Total bytes written by flushes (denominator for write amplification).
+    pub stats_bytes_flushed: AtomicU64,
+    /// Total bytes written by compaction outputs (numerator for write amp).
+    pub stats_bytes_compacted: AtomicU64,
 }
 
 impl EngineInner {
@@ -99,6 +112,11 @@ pub struct Stats {
     pub tiered: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Cumulative bytes written by flushes.
+    pub bytes_flushed: u64,
+    /// Cumulative bytes written by compaction outputs. Write amplification is
+    /// `bytes_compacted / bytes_flushed`.
+    pub bytes_compacted: u64,
 }
 
 pub struct Girder {
@@ -151,6 +169,8 @@ impl Girder {
             stats_flushes: AtomicU64::new(0),
             stats_compactions: AtomicU64::new(0),
             stats_tiered: AtomicU64::new(0),
+            stats_bytes_flushed: AtomicU64::new(0),
+            stats_bytes_compacted: AtomicU64::new(0),
             config,
         });
 
@@ -557,6 +577,8 @@ impl Girder {
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),
             cache_hits: self.inner.cache.hits.load(Ordering::Relaxed),
             cache_misses: self.inner.cache.misses.load(Ordering::Relaxed),
+            bytes_flushed: self.inner.stats_bytes_flushed.load(Ordering::Relaxed),
+            bytes_compacted: self.inner.stats_bytes_compacted.load(Ordering::Relaxed),
         }
     }
 

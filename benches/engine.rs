@@ -71,32 +71,63 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    // Compaction cadence during the build (batches between maintenance passes).
+    // The build measures the durable write path *with compaction running*, the
+    // way rivet's search-bench does (its 5 s tick fires ~continuously across the
+    // 44 s baseline build) — WS3's whole target is that build time and write
+    // amplification. Set GIRDER_BENCH_COMPACT_EVERY=0 to disable.
+    let compact_every: usize = std::env::var("GIRDER_BENCH_COMPACT_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(160);
+
     runtime.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let mut config = GirderConfig::at(dir.path());
         config.fsync = FsyncPolicy::EveryN(256);
-        config.memtable_max_records = 20_000;
-        config.tick_interval = Duration::from_secs(3600);
+        // rivet search-bench defaults (memtable 10k, compact_min 8): the config
+        // the plan's §0 numbers were measured under.
+        config.memtable_max_records = 10_000;
+        config.compact_min_segments = 8;
+        config.tick_interval = Duration::from_secs(3600); // compaction driven manually below
         let engine = Girder::open(config).await.unwrap();
 
-        // Write path (durable, batches of 500).
+        // Write path (durable, batches of 500), compacting periodically so the
+        // build cost includes compaction (the WS3 acceptance scenario).
         let start = Instant::now();
         for b in 0..n / 500 {
             let chunk: Vec<Record> = (0..500).map(|i| record(b * 500 + i)).collect();
             engine.put_batch(chunk).await.unwrap();
+            if compact_every > 0 && (b + 1) % compact_every == 0 {
+                engine.maintain().await.unwrap();
+            }
         }
         let write = start.elapsed();
         engine.flush().await.unwrap();
+        engine.maintain().await.unwrap(); // final settle (not counted in build)
         let stats = engine.stats();
+        let write_amp = if stats.bytes_flushed > 0 {
+            stats.bytes_compacted as f64 / stats.bytes_flushed as f64
+        } else {
+            0.0
+        };
         println!(
-            "build:  {n} records in {write:.2?} ({:.0} rec/s, batches of 500, fsync/256)",
+            "build:  {n} records in {write:.2?} ({:.0} rec/s, batches of 500, fsync/256, \
+             compact every {compact_every} batches)",
             n as f64 / write.as_secs_f64()
         );
         println!(
-            "segments: {} hot ({} records), on-disk {:.1} MB",
+            "segments: {} hot + {} cold ({} records), on-disk {:.1} MB",
             stats.hot_segments,
+            stats.cold_segments,
             stats.total_records_in_segments,
             total_segment_bytes(dir.path()) as f64 / (1024.0 * 1024.0),
+        );
+        println!(
+            "write-amp: {write_amp:.2}x  (flushed {:.1} MB, compacted {:.1} MB, {} compactions)",
+            stats.bytes_flushed as f64 / (1024.0 * 1024.0),
+            stats.bytes_compacted as f64 / (1024.0 * 1024.0),
+            stats.compactions,
         );
 
         // --- selective (uncorrelated): latency_ms > 1995 (~0.25%) ---

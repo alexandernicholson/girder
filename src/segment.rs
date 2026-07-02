@@ -30,6 +30,7 @@
 //!
 //! The zone map is stored in the manifest (not the file), so the manifest
 //! format does not migrate.
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::Path;
@@ -86,7 +87,7 @@ pub struct ZoneMap {
 }
 
 impl ZoneMap {
-    pub fn build(records: &[Record]) -> ZoneMap {
+    pub fn build<R: Borrow<Record>>(records: &[R]) -> ZoneMap {
         let mut zone = ZoneMap {
             min_ts: i64::MAX,
             max_ts: i64::MIN,
@@ -96,7 +97,8 @@ impl ZoneMap {
             numerics: BTreeMap::new(),
             count: records.len(),
         };
-        for (i, record) in records.iter().enumerate() {
+        for (i, r) in records.iter().enumerate() {
+            let record = r.borrow();
             zone.min_ts = zone.min_ts.min(record.timestamp);
             zone.max_ts = zone.max_ts.max(record.timestamp);
             if i == 0 || record.key < zone.min_key {
@@ -554,32 +556,32 @@ struct LabelPlan {
     mode: LabelMode,
 }
 
-fn label_names(records: &[Record]) -> BTreeSet<String> {
+fn label_names<R: Borrow<Record>>(records: &[R]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for r in records {
-        for k in r.labels.keys() {
+        for k in r.borrow().labels.keys() {
             names.insert(k.clone());
         }
     }
     names
 }
 
-fn numeric_names(records: &[Record]) -> BTreeSet<String> {
+fn numeric_names<R: Borrow<Record>>(records: &[R]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for r in records {
-        for k in r.numerics.keys() {
+        for k in r.borrow().numerics.keys() {
             names.insert(k.clone());
         }
     }
     names
 }
 
-fn plan_labels(records: &[Record]) -> Vec<LabelPlan> {
+fn plan_labels<R: Borrow<Record>>(records: &[R]) -> Vec<LabelPlan> {
     let mut plans = Vec::new();
     for name in label_names(records) {
         let mut distinct: BTreeSet<&str> = BTreeSet::new();
         for r in records {
-            if let Some(v) = r.labels.get(&name) {
+            if let Some(v) = r.borrow().labels.get(&name) {
                 distinct.insert(v.as_str());
             }
         }
@@ -592,7 +594,13 @@ fn plan_labels(records: &[Record]) -> Vec<LabelPlan> {
                 .collect();
             let codes: Vec<u16> = records
                 .iter()
-                .map(|r| r.labels.get(&name).map(|v| index[v.as_str()]).unwrap_or(0))
+                .map(|r| {
+                    r.borrow()
+                        .labels
+                        .get(&name)
+                        .map(|v| index[v.as_str()])
+                        .unwrap_or(0)
+                })
                 .collect();
             plans.push(LabelPlan {
                 name,
@@ -608,7 +616,7 @@ fn plan_labels(records: &[Record]) -> Vec<LabelPlan> {
     plans
 }
 
-fn build_blocks(records: &[Record], plans: &[LabelPlan]) -> Vec<BlockMeta> {
+fn build_blocks<R: Borrow<Record>>(records: &[R], plans: &[LabelPlan]) -> Vec<BlockMeta> {
     let count = records.len();
     let mut blocks = Vec::new();
     let mut s = 0;
@@ -618,6 +626,7 @@ fn build_blocks(records: &[Record], plans: &[LabelPlan]) -> Vec<BlockMeta> {
         let mut max_ts = i64::MIN;
         let mut numerics: BTreeMap<String, (f64, f64)> = BTreeMap::new();
         for r in &records[s..e] {
+            let r = r.borrow();
             min_ts = min_ts.min(r.timestamp);
             max_ts = max_ts.max(r.timestamp);
             for (k, v) in &r.numerics {
@@ -650,8 +659,8 @@ fn build_blocks(records: &[Record], plans: &[LabelPlan]) -> Vec<BlockMeta> {
             end: e as u32,
             min_ts,
             max_ts,
-            first_key: records[s].key.clone(),
-            last_key: records[e - 1].key.clone(),
+            first_key: records[s].borrow().key.clone(),
+            last_key: records[e - 1].borrow().key.clone(),
             numerics,
             label_bitsets,
         });
@@ -706,7 +715,7 @@ fn encode_strings(items: &[&[u8]]) -> Vec<u8> {
     body
 }
 
-fn encode_label_column(records: &[Record], plan: &LabelPlan) -> Vec<u8> {
+fn encode_label_column<R: Borrow<Record>>(records: &[R], plan: &LabelPlan) -> Vec<u8> {
     match &plan.mode {
         LabelMode::Dict { dict, codes } => {
             let mut body = Vec::new();
@@ -728,7 +737,7 @@ fn encode_label_column(records: &[Record], plan: &LabelPlan) -> Vec<u8> {
             let mut presence = vec![0u8; count.div_ceil(8)];
             let mut present_vals: Vec<&[u8]> = Vec::new();
             for (i, r) in records.iter().enumerate() {
-                if let Some(v) = r.labels.get(&plan.name) {
+                if let Some(v) = r.borrow().labels.get(&plan.name) {
                     presence[i / 8] |= 1 << (i % 8);
                     present_vals.push(v.as_bytes());
                 }
@@ -740,12 +749,12 @@ fn encode_label_column(records: &[Record], plan: &LabelPlan) -> Vec<u8> {
     }
 }
 
-fn encode_numeric_column(records: &[Record], name: &str) -> Vec<u8> {
+fn encode_numeric_column<R: Borrow<Record>>(records: &[R], name: &str) -> Vec<u8> {
     let count = records.len();
     let mut presence = vec![0u8; count.div_ceil(8)];
     let mut vals: Vec<f64> = Vec::new();
     for (i, r) in records.iter().enumerate() {
-        if let Some(v) = r.numerics.get(name) {
+        if let Some(v) = r.borrow().numerics.get(name) {
             presence[i / 8] |= 1 << (i % 8);
             vals.push(*v);
         }
@@ -758,23 +767,23 @@ fn encode_numeric_column(records: &[Record], name: &str) -> Vec<u8> {
     body
 }
 
-fn encode_payloads(records: &[Record]) -> Vec<u8> {
+fn encode_payloads<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
     let count = records.len();
-    let total: usize = records.iter().map(|r| r.payload.len()).sum();
+    let total: usize = records.iter().map(|r| r.borrow().payload.len()).sum();
     let mut body = Vec::with_capacity(8 * (count + 1) + total);
     let mut off = 0u64;
     body.extend_from_slice(&off.to_le_bytes());
     for r in records {
-        off += r.payload.len() as u64;
+        off += r.borrow().payload.len() as u64;
         body.extend_from_slice(&off.to_le_bytes());
     }
     for r in records {
-        body.extend_from_slice(&r.payload);
+        body.extend_from_slice(&r.borrow().payload);
     }
     body
 }
 
-fn encode_v2(records: &[Record]) -> Result<Vec<u8>> {
+fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
     let count = records.len();
     let plans = plan_labels(records);
     let mut out = Vec::new();
@@ -782,12 +791,12 @@ fn encode_v2(records: &[Record]) -> Result<Vec<u8>> {
     out.extend_from_slice(&VERSION_V2.to_le_bytes());
     let mut dir: Vec<SectionEntry> = Vec::new();
 
-    let key_items: Vec<&[u8]> = records.iter().map(|r| r.key.as_bytes()).collect();
+    let key_items: Vec<&[u8]> = records.iter().map(|r| r.borrow().key.as_bytes()).collect();
     push_section(&mut out, &mut dir, K_KEYS, "", &encode_strings(&key_items));
 
     let mut ts = Vec::with_capacity(count * 8);
     for r in records {
-        ts.extend_from_slice(&r.timestamp.to_le_bytes());
+        ts.extend_from_slice(&r.borrow().timestamp.to_le_bytes());
     }
     push_section(&mut out, &mut dir, K_TS, "", &ts);
 
@@ -830,12 +839,39 @@ fn encode_v2(records: &[Record]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Write records (sorted by key) to a v2 segment file. Returns the zone map.
+/// Write records to a v2 segment file, sorting them by key first. Returns the
+/// zone map. (Production writes go through the presorted/borrowed variants;
+/// this sort-then-write helper is retained for tests and fixtures.)
+#[cfg(test)]
 pub fn write_segment(path: &Path, records: &mut [Record]) -> Result<ZoneMap> {
     records.sort_by(|a, b| a.key.cmp(&b.key));
+    write_sorted(path, records)
+}
+
+/// Write already-key-sorted owned records to a v2 segment (compaction split
+/// output — the merged stream is BTreeMap-ordered, so no re-sort is needed).
+pub fn write_segment_presorted(path: &Path, records: &[Record]) -> Result<ZoneMap> {
+    write_sorted(path, records)
+}
+
+/// Zero-clone flush path: write a segment straight from `&Record` borrows that
+/// are already key-sorted (a frozen memtable's `BTreeMap::values()`), without
+/// cloning payloads into an intermediate `Vec` or re-sorting.
+pub fn write_segment_refs(path: &Path, records: &[&Record]) -> Result<ZoneMap> {
+    write_sorted(path, records)
+}
+
+/// Encode a key-sorted record slice (owned or borrowed) and write it atomically
+/// (tmp → fsync → rename). Callers guarantee the input is sorted by key.
+fn write_sorted<R: Borrow<Record>>(path: &Path, records: &[R]) -> Result<ZoneMap> {
+    debug_assert!(
+        records
+            .windows(2)
+            .all(|w| w[0].borrow().key <= w[1].borrow().key),
+        "write_sorted requires key-sorted input"
+    );
     let zone = ZoneMap::build(records);
     let out = encode_v2(records)?;
-    // Atomic-ish: write tmp, fsync, rename.
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &out)?;
     let file = std::fs::File::open(&tmp)?;
@@ -1238,6 +1274,53 @@ mod tests {
         let rec = cols.materialize(2, None).unwrap();
         assert_eq!(rec.key, "c");
         assert_eq!(rec.payload, b"p-c");
+    }
+
+    /// WS3: compaction reads mixed v1 + v2 inputs (via `read_all_records`),
+    /// merges newest-wins, and always writes v2 (`write_segment_presorted`).
+    /// This is the exact merge mechanism `actors::compact` uses.
+    #[test]
+    fn compaction_merges_v1_and_v2_into_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1_path = dir.path().join("old.gird");
+        let v2_path = dir.path().join("new.gird");
+        // Older v1 segment: k=old, plus a v1-only key.
+        let mut v1 = vec![
+            record("k", 1, "v1-model", 10.0),
+            record("only_v1", 1, "v1-model", 11.0),
+        ];
+        write_v1(&v1_path, &mut v1);
+        // Newer v2 segment: k rewritten, plus a v2-only key.
+        let mut v2 = vec![
+            record("k", 2, "v2-model", 20.0),
+            record("only_v2", 2, "v2-model", 21.0),
+        ];
+        write_segment(&v2_path, &mut v2).unwrap();
+
+        // Merge newest-wins: read v1 (older) then v2 (newer); later wins.
+        let mut merged: BTreeMap<String, Record> = BTreeMap::new();
+        for r in read_all_records(&v1_path).unwrap() {
+            merged.insert(r.key.clone(), r);
+        }
+        for r in read_all_records(&v2_path).unwrap() {
+            merged.insert(r.key.clone(), r);
+        }
+        let out: Vec<Record> = merged.into_values().collect();
+        let out_path = dir.path().join("merged.gird");
+        write_segment_presorted(&out_path, &out).unwrap();
+
+        // Output is v2.
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(header(&bytes).unwrap().1, VERSION_V2, "output must be v2");
+
+        // No lost records; k resolves to the newer (v2) version.
+        let all = read_all_records(&out_path).unwrap();
+        assert_eq!(all.len(), 3); // k, only_v1, only_v2
+        let by_key: BTreeMap<&str, &Record> = all.iter().map(|r| (r.key.as_str(), r)).collect();
+        assert_eq!(by_key["k"].labels["model"], "v2-model");
+        assert_eq!(by_key["k"].timestamp, 2);
+        assert!(by_key.contains_key("only_v1"));
+        assert!(by_key.contains_key("only_v2"));
     }
 
     #[test]

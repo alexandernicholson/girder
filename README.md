@@ -59,16 +59,26 @@ construction, not by lock choreography:
   per-tier segment counts.
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
-## Numbers (release, laptop, 100k × ~1.3KB records)
+## Numbers (release, laptop, **1M × ~1.3KB records**, columnar v2 engine)
 
 | operation | result |
 |---|---|
-| durable writes (batch 500, fsync/256) | **~674k records/s** |
-| zone-map-pruned query (no match) | **~3.9µs** |
-| point get (warm) | ~5.7µs |
-| label+range scan over 100k, cold / warm | 125ms / 47ms |
+| durable build, 1M records (batch 500, fsync/256) | **7.15s (~140k rec/s)** |
+| selective scan, uncorrelated numeric (~0.25% match, limit 50) — warm | **~2.3ms** |
+| selective scan — cold | **13.1ms, reading 46.9MB** (columns + survivor payloads only; was 361ms / 1.19GB whole-file) |
+| broad filtered + sorted page (~17% match, top-k limit 50) — warm | **~2.5ms** |
+| newest-first page (`order_by` ts desc, limit 50) | **~1.2ms** (early termination: 1 segment loaded) |
+| recent time-range scan (~1% match) — warm | **~4.7ms** |
+| point get (warm) | ~3.5µs |
+| zone-map-pruned query (no match) | ~29µs |
 
-Run them: `cargo bench`.
+Pre-v2 baselines for the same shapes @1M: selective ~3.0s, broad ~4.75s,
+recent ~70ms — the v2 engine (columnar segments + block pruning + top-k
+pushdown + tiered compaction + section cache, `docs/PERF-PLAN.md`) is
+**~1,000–2,000× faster on the weak paths** without regressing the strong one.
+`stats.bytes_read` makes per-query I/O observable.
+
+Run them: `cargo bench` (set `GIRDER_BENCH_N` to change corpus size; default 1M).
 
 ## Use
 

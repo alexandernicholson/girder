@@ -1,16 +1,20 @@
 //! Quick throughput/latency numbers without a criterion dependency:
 //! `cargo bench` runs this as a plain binary (harness = false).
 //!
-//! Measures the three query shapes from docs/PERF-PLAN.md §0 at scale so the
-//! WS1 acceptance targets are checkable inside this repo:
+//! Measures the query shapes from docs/PERF-PLAN.md §0 at scale so the WS1/WS2
+//! acceptance targets are checkable inside this repo:
+//!
 //!   - selective (uncorrelated): `latency_ms > 1995`  (~0.25%, no pruning)
 //!   - broad (label + numeric):  `model=gpt-4o & latency_ms > 1000` (~17%)
+//!   - broad sorted page (WS2):  same filter, `order_by` latency desc, limit 50
+//!   - newest page (WS2):        `order_by` timestamp desc, limit 50
 //!   - recent (time range):      newest ~1% by timestamp
+//!
 //! Set `GIRDER_BENCH_N` to override the corpus size (default 1_000_000).
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use girder::{FsyncPolicy, Girder, GirderConfig, QuerySpec, Record};
+use girder::{FsyncPolicy, Girder, GirderConfig, OrderBy, QuerySpec, Record};
 
 fn record(i: usize) -> Record {
     Record {
@@ -118,6 +122,35 @@ fn main() {
         };
         let (p50, hits) = warm_p50(5, || runtime_block(&engine, &broad));
         println!("broad      warm_p50={p50:.2?}  ({hits} hits returned, limit 50)");
+
+        // --- broad SORTED PAGE (WS2): same filter, order_by latency desc,
+        //     limit 50. Bounded heap over the numeric column materializes only
+        //     50 records instead of ~166k. Target: <= 80 ms p50 warm. ---
+        let broad_sorted = QuerySpec {
+            labels: vec![("model".into(), "gpt-4o".into())],
+            numeric_ranges: vec![("latency_ms".into(), 1000.0, f64::MAX)],
+            order_by: Some(OrderBy::NumericDesc("latency_ms".into())),
+            limit: 50,
+            ..Default::default()
+        };
+        let (p50, hits) = warm_p50(5, || runtime_block(&engine, &broad_sorted));
+        println!("broad(sorted page, order_by latency desc)  warm_p50={p50:.2?}  ({hits} hits, limit 50)");
+
+        // --- newest page (WS2): order_by timestamp desc, limit 50, no filter.
+        //     Suffix-max early termination should touch only the newest
+        //     segment(s) instead of the whole corpus. ---
+        let newest_before = engine.stats().cache_misses;
+        let newest = QuerySpec {
+            order_by: Some(OrderBy::TimestampDesc),
+            limit: 50,
+            ..Default::default()
+        };
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &newest));
+        let newest_loaded = engine.stats().cache_misses - newest_before;
+        println!(
+            "newest page(order_by ts desc)  warm_p50={p50:.2?}  ({hits} hits, limit 50; \
+             segments loaded across warmup+reps: {newest_loaded})"
+        );
 
         // --- recent (time range): newest ~1% by timestamp ---
         let lo = (n - n / 100) as i64;

@@ -245,6 +245,22 @@ impl SegmentColumns {
         &self.keys[self.key_offsets[i] as usize..self.key_offsets[i + 1] as usize]
     }
 
+    /// Timestamp of row `i` (for order-by / early-termination bounds).
+    #[inline]
+    pub fn timestamp_at(&self, i: usize) -> i64 {
+        self.timestamps[i]
+    }
+
+    /// Value of numeric `name` at row `i`, or `None` if absent (used as the
+    /// sort key for numeric `order_by`). No payload touch.
+    #[inline]
+    pub fn numeric_at(&self, name: &str, i: usize) -> Option<f64> {
+        match self.numerics.get(name) {
+            Some(nc) if nc.present[i] => Some(nc.values[i]),
+            _ => None,
+        }
+    }
+
     /// True if materializing a row needs the segment file open (v2 payloads).
     pub fn payload_needs_file(&self) -> bool {
         matches!(self.payloads, Payloads::File { .. })

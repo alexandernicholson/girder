@@ -58,6 +58,21 @@ mod serde_bytes_vec {
     }
 }
 
+/// Result ordering for `scan`. The tiebreak on every variant is key ascending
+/// (matching the historical sort). Records missing the ordered numeric (or
+/// holding a NaN) rank *after* all present values, for both directions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderBy {
+    /// Newest first — identical ordering to `order_by: None`.
+    TimestampDesc,
+    /// Oldest first.
+    TimestampAsc,
+    /// Highest value of the named numeric first.
+    NumericDesc(String),
+    /// Lowest value of the named numeric first.
+    NumericAsc(String),
+}
+
 /// A pruning-friendly query. All conditions AND together; empty spec = scan
 /// everything (bounded by `limit`).
 #[derive(Debug, Clone, Default)]
@@ -72,6 +87,11 @@ pub struct QuerySpec {
     pub key_prefix: Option<String>,
     /// Max records returned (newest-first). 0 = unlimited.
     pub limit: usize,
+    /// Result ordering. `None` ⇒ exactly the historical semantics: timestamp
+    /// descending (key ascending tiebreak), truncated after a full sort.
+    /// `Some(_)` with `limit > 0` engages a bounded top-k heap that never
+    /// materializes the full match set (see `Girder::scan`).
+    pub order_by: Option<OrderBy>,
 }
 
 impl QuerySpec {

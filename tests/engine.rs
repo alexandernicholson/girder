@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use girder::{FsyncPolicy, Girder, GirderConfig, QuerySpec, Record};
+use girder::{FsyncPolicy, Girder, GirderConfig, OrderBy, QuerySpec, Record};
 
 fn record(key: &str, ts: i64, model: &str, latency: f64) -> Record {
     Record {
@@ -390,6 +390,257 @@ async fn column_scan_matches_naive_oracle() {
         let got = engine.scan(spec).await.unwrap();
         assert_eq!(got, expected, "spec {spec:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// WS2: order_by / top-k pushdown
+// ---------------------------------------------------------------------------
+
+/// Numeric-column value for ordering: absent or NaN ⇒ `None` (ranks last).
+fn ord_num(r: &Record, name: &str) -> Option<f64> {
+    r.numerics.get(name).copied().filter(|v| !v.is_nan())
+}
+
+/// Reference total order mirroring the engine's `order_by` semantics: the
+/// ordered dimension first, key ascending as the tiebreak, missing values last.
+fn oracle_cmp(order: &OrderBy, a: &Record, b: &Record) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let primary = match order {
+        OrderBy::TimestampDesc => b.timestamp.cmp(&a.timestamp),
+        OrderBy::TimestampAsc => a.timestamp.cmp(&b.timestamp),
+        OrderBy::NumericDesc(n) => match (ord_num(a, n), ord_num(b, n)) {
+            (Some(x), Some(y)) => y.total_cmp(&x), // higher first
+            (Some(_), None) => Ordering::Less,     // present before missing
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+        OrderBy::NumericAsc(n) => match (ord_num(a, n), ord_num(b, n)) {
+            (Some(x), Some(y)) => x.total_cmp(&y), // lower first
+            (Some(_), None) => Ordering::Less,     // present before missing
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    };
+    primary.then_with(|| a.key.cmp(&b.key))
+}
+
+/// Naive newest-wins oracle: filter, sort by the given order, truncate.
+fn oracle_page(truth: &BTreeMap<String, Record>, spec: &QuerySpec, order: &OrderBy) -> Vec<Record> {
+    let mut v: Vec<Record> = truth
+        .values()
+        .filter(|r| spec.matches(r))
+        .cloned()
+        .collect();
+    v.sort_by(|a, b| oracle_cmp(order, a, b));
+    if spec.limit > 0 {
+        v.truncate(spec.limit);
+    }
+    v
+}
+
+/// Top-k with every `OrderBy` and several limits must match a naive full-scan
+/// oracle across a corpus with rewrites (overlapping segments), mixed schemas,
+/// and missing/NaN order-by values. This is the soundness proof for the
+/// bounded-heap + early-termination scan path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topk_matches_naive_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.memtable_max_records = 150; // many segments, some overlapping
+    let engine = Girder::open(cfg).await.unwrap();
+
+    let mut truth: BTreeMap<String, Record> = BTreeMap::new();
+    let mut state = 0xABCDEF01u64;
+    let mut rng = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for ts in 1..=3000i64 {
+        // 300 keys → lots of rewrites; some rewrites carry a LOWER timestamp.
+        let key = format!("k/{:04}", rng() % 300);
+        let this_ts = if rng() % 7 == 0 {
+            (rng() % 3000) as i64
+        } else {
+            ts
+        };
+        let model = ["gpt-4o", "claude", "llama"][(rng() % 3) as usize];
+        let mut labels = BTreeMap::from([("model".to_string(), model.to_string())]);
+        if rng() % 2 == 0 {
+            labels.insert("region".to_string(), format!("r{}", rng() % 4));
+        }
+        let mut numerics = BTreeMap::new();
+        if rng() % 5 != 0 {
+            numerics.insert("latency_ms".to_string(), (rng() % 2000) as f64);
+        }
+        if rng() % 3 == 0 {
+            numerics.insert("tokens".to_string(), (rng() % 500) as f64);
+        }
+        let rec = Record {
+            key: key.clone(),
+            timestamp: this_ts,
+            labels,
+            numerics,
+            payload: format!("pl-{key}-{this_ts}").into_bytes(),
+        };
+        truth.insert(key, rec.clone());
+        engine.put(rec).await.unwrap();
+        if rng() % 250 == 0 {
+            engine.flush().await.unwrap(); // overlapping segments
+        }
+    }
+    engine.maintain().await.unwrap(); // exercise compaction too
+
+    let orders = [
+        OrderBy::TimestampDesc,
+        OrderBy::TimestampAsc,
+        OrderBy::NumericDesc("latency_ms".into()),
+        OrderBy::NumericAsc("latency_ms".into()),
+        OrderBy::NumericDesc("tokens".into()),
+    ];
+    let filters = [
+        QuerySpec::default(),
+        QuerySpec {
+            labels: vec![("model".into(), "gpt-4o".into())],
+            numeric_ranges: vec![("latency_ms".into(), 1000.0, f64::MAX)],
+            ..Default::default()
+        },
+        QuerySpec {
+            labels: vec![("region".into(), "r1".into())],
+            ..Default::default()
+        },
+        QuerySpec {
+            time: Some((1000, 2500)),
+            ..Default::default()
+        },
+    ];
+    for order in &orders {
+        for base in &filters {
+            for &limit in &[1usize, 5, 50, 100000] {
+                let spec = QuerySpec {
+                    order_by: Some(order.clone()),
+                    limit,
+                    ..base.clone()
+                };
+                let got = engine.scan(&spec).await.unwrap();
+                let want = oracle_page(&truth, &spec, order);
+                assert_eq!(got, want, "order {order:?} limit {limit} base {base:?}");
+            }
+        }
+    }
+}
+
+/// `order_by: None` and `order_by: Some(TimestampDesc)` must produce the exact
+/// same page (same set, same order) — the full-sort path and the bounded-heap
+/// path agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn order_by_none_equals_timestamp_desc() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.memtable_max_records = 120;
+    let engine = Girder::open(cfg).await.unwrap();
+    for i in 0..900 {
+        let ts = ((i * 7) % 900) as i64; // non-monotonic timestamps
+        engine
+            .put(record(&format!("k{i:04}"), ts, "gpt-4o", (i % 300) as f64))
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    let base = QuerySpec {
+        numeric_ranges: vec![("latency_ms".into(), 50.0, f64::MAX)],
+        limit: 50,
+        ..Default::default()
+    };
+    let none = engine.scan(&base).await.unwrap();
+    let desc = engine
+        .scan(&QuerySpec {
+            order_by: Some(OrderBy::TimestampDesc),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(none, desc, "None must equal TimestampDesc, page for page");
+}
+
+/// Newest-wins vs early termination (the subtle one): a key rewritten in a
+/// NEWER segment with a LOWER timestamp must resolve to the new version, and
+/// the stale high-timestamp version must never surface in a timestamp-desc
+/// page — even though the older segment's zone map has a higher `max_ts`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_termination_respects_lower_ts_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.compact_min_segments = 100; // keep segments separate
+    let engine = Girder::open(cfg).await.unwrap();
+
+    // Older segment: high timestamps, including K@500.
+    engine.put(record("A", 501, "gpt-4o", 1.0)).await.unwrap();
+    engine.put(record("B", 502, "gpt-4o", 1.0)).await.unwrap();
+    engine.put(record("K", 500, "gpt-4o", 1.0)).await.unwrap();
+    engine.flush().await.unwrap();
+    // Newer segment: K rewritten with a LOWER timestamp, plus low-ts fillers.
+    engine.put(record("C", 2, "gpt-4o", 1.0)).await.unwrap();
+    engine.put(record("D", 3, "gpt-4o", 1.0)).await.unwrap();
+    engine.put(record("K", 1, "gpt-4o", 1.0)).await.unwrap();
+    engine.flush().await.unwrap();
+
+    let spec = QuerySpec {
+        order_by: Some(OrderBy::TimestampDesc),
+        limit: 3,
+        ..Default::default()
+    };
+    let got = engine.scan(&spec).await.unwrap();
+    let keys: Vec<(&str, i64)> = got.iter().map(|r| (r.key.as_str(), r.timestamp)).collect();
+    // Top-3 by ts desc over newest-wins truth {A@501,B@502,C@2,D@3,K@1}.
+    assert_eq!(keys, vec![("B", 502), ("A", 501), ("D", 3)]);
+    // K resolves to its newest (lower-ts) version; the stale K@500 is gone.
+    let k = engine.get("K").await.unwrap().unwrap();
+    assert_eq!(k.timestamp, 1);
+    assert!(!got.iter().any(|r| r.key == "K" && r.timestamp == 500));
+}
+
+/// Early termination must not touch old segments: a newest-page query over
+/// many time-adjacent segments loads only the trailing (newest) segment(s),
+/// so `cache_misses` stays far below the segment count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_termination_skips_old_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.memtable_max_records = 100;
+    cfg.compact_min_segments = 1000; // never compact
+    let engine = Girder::open(cfg).await.unwrap();
+
+    // 10 disjoint, time-adjacent segments of 100 records (ts increasing).
+    for seg in 0..10 {
+        for i in 0..100 {
+            let n = seg * 100 + i;
+            engine
+                .put(record(&format!("k{n:05}"), n as i64, "gpt-4o", 1.0))
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+    assert_eq!(engine.stats().hot_segments, 10);
+
+    let before = engine.stats().cache_misses;
+    let spec = QuerySpec {
+        order_by: Some(OrderBy::TimestampDesc),
+        limit: 50,
+        ..Default::default()
+    };
+    let got = engine.scan(&spec).await.unwrap();
+    let loaded = engine.stats().cache_misses - before;
+    // The newest segment (ts 900..999) already fills the 50-row page; the
+    // suffix bound stops the scan before any older segment is loaded.
+    assert_eq!(loaded, 1, "only the newest segment was loaded");
+    // And the page is correct: the 50 newest timestamps, descending.
+    let want: Vec<i64> = (950..1000).rev().collect();
+    let got_ts: Vec<i64> = got.iter().map(|r| r.timestamp).collect();
+    assert_eq!(got_ts, want);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

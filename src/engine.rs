@@ -1,5 +1,6 @@
 //! The engine facade: open (with recovery), put, scan, get, flush, stats.
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,9 +12,9 @@ use rebar_core::runtime::Runtime;
 use crate::actors::{MaintCall, MaintenanceActor, WriterActor, WriterMsg};
 use crate::cache::SegmentCache;
 use crate::error::{GirderError, Result};
-use crate::manifest::{segment_path, Manifest, Tier};
-use crate::record::{QuerySpec, Record};
-use crate::segment;
+use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier};
+use crate::record::{OrderBy, QuerySpec, Record};
+use crate::segment::{self, SegmentColumns};
 use crate::wal::{FsyncPolicy, Wal};
 
 #[derive(Debug, Clone)]
@@ -285,14 +286,31 @@ impl Girder {
         Ok(None)
     }
 
-    /// Scan matching records, newest-first by timestamp. `spec.limit`
-    /// truncates after sorting (0 = unlimited).
+    /// Scan matching records.
     ///
     /// The segment path is column-native: filters run over typed columns (with
     /// block-index pruning) and payloads are sliced out only for surviving
     /// rows. Newest-wins dedupe is preserved — a key present in a newer source
     /// shadows any older version.
+    ///
+    /// Ordering follows `spec.order_by` (see [`OrderBy`]); `None` is timestamp
+    /// descending, byte-identical to the historical behavior. With an explicit
+    /// `order_by` and `limit > 0` the engine keeps a bounded top-k heap instead
+    /// of materializing every match, and — for `TimestampDesc` — stops early
+    /// once no unvisited (older) segment can beat the weakest kept row.
     pub async fn scan(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
+        if spec.limit > 0 {
+            if let Some(order) = &spec.order_by {
+                return self.scan_topk(spec, order);
+            }
+        }
+        self.scan_full(spec)
+    }
+
+    /// Materialize every match, dedupe newest-wins, sort by the effective
+    /// order, then truncate. This is the unbounded / `order_by: None` path and
+    /// is byte-identical to the historical scan for `None`.
+    fn scan_full(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<Record> = Vec::new();
 
@@ -322,8 +340,7 @@ impl Girder {
         // one segment, so no cross-segment shadow tracking is needed — only
         // membership checks against the memtable/frozen seed. Otherwise fall
         // back to inserting every visited key of each non-final source so a
-        // block-pruned newer version still shadows an older match (correctness
-        // over speed; WS2 removes the clone cost).
+        // block-pruned newer version still shadows an older match.
         let metas = self.pruned_segments(spec);
         let disjoint = key_ranges_disjoint(&metas);
         let last = metas.len().saturating_sub(1);
@@ -346,13 +363,123 @@ impl Girder {
             }
         }
 
-        out.sort_by(|a, b| {
-            b.timestamp
-                .cmp(&a.timestamp)
-                .then_with(|| a.key.cmp(&b.key))
-        });
+        let order = spec.order_by.as_ref();
+        out.sort_by(|a, b| record_cmp(order, a, b));
         if spec.limit > 0 {
             out.truncate(spec.limit);
+        }
+        Ok(out)
+    }
+
+    /// Bounded top-k over the ordered dimension. Keeps a heap of the `limit`
+    /// best rows and materializes payloads only for the survivors — the broad
+    /// sorted-page shape never allocates the ~166k-record intermediate.
+    ///
+    /// Dedupe borrows keys from the loaded columns for membership tests (no
+    /// per-matching-row `String` clone) and only pays a clone when a candidate
+    /// actually enters the heap (bounded by `limit` + improvements). Segment
+    /// keys are recorded in `seen` only when key ranges overlap (rare after
+    /// append/compaction) so a block-pruned newer version still shadows.
+    ///
+    /// **Early-termination soundness (timestamp desc).** Segments are visited
+    /// strictly newest-id first (write recency — required for newest-wins).
+    /// The loop *stops* (never skip-then-continue) as soon as `suffix_max_ts`
+    /// over all unvisited segments is below the weakest kept row: no unvisited
+    /// row can enter the page, and because every remaining segment is older
+    /// than every visited one, no emitted row can later be shadowed by an
+    /// unvisited newer version. A rewrite with a *lower* timestamp in a newer
+    /// segment is therefore handled correctly (the newer, low-ts version was
+    /// already seen; the older, high-ts version is never emitted).
+    fn scan_topk(&self, spec: &QuerySpec, order: &OrderBy) -> Result<Vec<Record>> {
+        let limit = spec.limit;
+        let numeric_name = match order {
+            OrderBy::NumericAsc(n) | OrderBy::NumericDesc(n) => Some(n.as_str()),
+            _ => None,
+        };
+        let early_term = matches!(order, OrderBy::TimestampDesc);
+
+        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Phase 1: newest sources (memtable → frozen). Guards are held only for
+        // this in-memory pass, never across segment I/O.
+        {
+            let memtable = self.inner.memtable.read().unwrap();
+            for rec in memtable.values() {
+                let fresh = seen.insert(rec.key.clone());
+                if fresh && spec.matches(rec) {
+                    let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
+                    let prim = make_prim(order, rec.timestamp, num);
+                    offer(&mut heap, limit, prim, &rec.key, || {
+                        CandSrc::Mem(rec.clone())
+                    });
+                }
+            }
+        }
+        {
+            let frozen = self.inner.frozen.read().unwrap();
+            for (_, map) in frozen.iter().rev() {
+                for rec in map.values() {
+                    let fresh = seen.insert(rec.key.clone());
+                    if fresh && spec.matches(rec) {
+                        let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
+                        let prim = make_prim(order, rec.timestamp, num);
+                        offer(&mut heap, limit, prim, &rec.key, || {
+                            CandSrc::Mem(rec.clone())
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: segments newest-id first, with suffix-max early termination.
+        let metas = self.pruned_segments(spec);
+        let disjoint = key_ranges_disjoint(&metas);
+        let suffix_max = suffix_max_ts(&metas);
+        for (i, meta) in metas.iter().enumerate() {
+            if early_term && heap.len() >= limit {
+                let worst_ts = heap.peek().unwrap().timestamp();
+                if suffix_max[i] < worst_ts {
+                    break; // sound stop — see the doc comment above.
+                }
+            }
+            let cols = self.load_columns(meta)?;
+            for &row in &cols.matching_rows(spec) {
+                let r = row as usize;
+                let key = cols.key_at(r);
+                if seen.contains(key) {
+                    continue; // shadowed by a newer source
+                }
+                let num = numeric_name.and_then(|n| cols.numeric_at(n, r));
+                let prim = make_prim(order, cols.timestamp_at(r), num);
+                offer(&mut heap, limit, prim, key, || CandSrc::Seg {
+                    cols: Arc::clone(&cols),
+                    meta_idx: i,
+                    row: r,
+                });
+            }
+            if !disjoint {
+                for r in 0..cols.count() {
+                    seen.insert(cols.key_at(r).to_string());
+                }
+            }
+        }
+
+        // Drain best-first; materialize (payload slice) only the survivors.
+        let items = heap.into_sorted_vec();
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item.src {
+                CandSrc::Mem(rec) => out.push(rec),
+                CandSrc::Seg {
+                    cols,
+                    meta_idx,
+                    row,
+                } => {
+                    let file = self.open_payload_file(&metas[meta_idx], &cols)?;
+                    out.push(cols.materialize(row, file.as_ref())?);
+                }
+            }
         }
         Ok(out)
     }
@@ -448,11 +575,177 @@ impl Girder {
 
 /// Are the segments' key ranges pairwise disjoint? If so, a key can appear in
 /// at most one segment and cross-segment shadow tracking is unnecessary.
-fn key_ranges_disjoint(metas: &[crate::manifest::SegmentMeta]) -> bool {
+fn key_ranges_disjoint(metas: &[SegmentMeta]) -> bool {
     let mut ranges: Vec<(&str, &str)> = metas
         .iter()
         .map(|m| (m.zone.min_key.as_str(), m.zone.max_key.as_str()))
         .collect();
     ranges.sort_by(|a, b| a.0.cmp(b.0));
     ranges.windows(2).all(|w| w[0].1 < w[1].0)
+}
+
+// ---------------------------------------------------------------------------
+// Ordering (order_by + top-k)
+// ---------------------------------------------------------------------------
+
+/// Direction-adjusted primary sort key: **smaller `Prim` ⇒ ranks earlier** in
+/// the output, for every `OrderBy`. `class == 1` marks a missing/NaN ordered
+/// value, which always sorts after present values regardless of direction.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+struct Prim {
+    class: u8,
+    ord: i128,
+}
+
+/// Map an f64 to an integer with the same total order as `f64::total_cmp`
+/// (NaN is excluded upstream). Standard IEEE-754 "radix" transform.
+fn f64_ordered(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits & (1 << 63) != 0 {
+        !bits // negative: flip everything
+    } else {
+        bits | (1 << 63) // non-negative: flip sign bit
+    }
+}
+
+/// Build the primary sort key for one record's `(timestamp, ordered-numeric)`.
+/// `num` is only consulted for the numeric orders.
+fn make_prim(order: &OrderBy, ts: i64, num: Option<f64>) -> Prim {
+    match order {
+        OrderBy::TimestampAsc => Prim {
+            class: 0,
+            ord: ts as i128,
+        },
+        OrderBy::TimestampDesc => Prim {
+            class: 0,
+            ord: -(ts as i128),
+        },
+        OrderBy::NumericAsc(_) => match num {
+            Some(v) if !v.is_nan() => Prim {
+                class: 0,
+                ord: f64_ordered(v) as i128,
+            },
+            _ => Prim { class: 1, ord: 0 },
+        },
+        OrderBy::NumericDesc(_) => match num {
+            Some(v) if !v.is_nan() => Prim {
+                class: 0,
+                ord: -(f64_ordered(v) as i128),
+            },
+            _ => Prim { class: 1, ord: 0 },
+        },
+    }
+}
+
+fn record_prim(order: &OrderBy, r: &Record) -> Prim {
+    let num = match order {
+        OrderBy::NumericAsc(n) | OrderBy::NumericDesc(n) => r.numerics.get(n).copied(),
+        _ => None,
+    };
+    make_prim(order, r.timestamp, num)
+}
+
+/// Total order for the full/`None` path. `None` ⇒ timestamp descending, key
+/// ascending — the historical sort, bit-for-bit.
+fn record_cmp(order: Option<&OrderBy>, a: &Record, b: &Record) -> CmpOrdering {
+    let order = order.unwrap_or(&OrderBy::TimestampDesc);
+    record_prim(order, a)
+        .cmp(&record_prim(order, b))
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+/// Where a heap candidate's data lives, so payload materialization can be
+/// deferred to the surviving rows.
+enum CandSrc {
+    /// A memtable/frozen record (owned clone — taken only when it enters the
+    /// heap, so non-survivors are never cloned).
+    Mem(Record),
+    /// A segment row; the `Arc` keeps the column set alive for materialization.
+    Seg {
+        cols: Arc<SegmentColumns>,
+        meta_idx: usize,
+        row: usize,
+    },
+}
+
+/// One kept candidate. `Ord` compares only `(prim, key)`; the heap is a
+/// max-heap whose top is therefore the *weakest* kept row (largest `Prim`,
+/// then largest key), i.e. the next to be evicted.
+struct HeapItem {
+    prim: Prim,
+    key: Box<str>,
+    src: CandSrc,
+}
+
+impl HeapItem {
+    fn timestamp(&self) -> i64 {
+        match &self.src {
+            CandSrc::Mem(r) => r.timestamp,
+            CandSrc::Seg { cols, row, .. } => cols.timestamp_at(*row),
+        }
+    }
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.prim == other.prim && self.key == other.key
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.prim
+            .cmp(&other.prim)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+/// Offer a candidate to the bounded top-k heap. Compares against the current
+/// weakest kept row *before* allocating the key / building the source, so the
+/// steady state allocates nothing for rejected candidates.
+fn offer<F: FnOnce() -> CandSrc>(
+    heap: &mut BinaryHeap<HeapItem>,
+    limit: usize,
+    prim: Prim,
+    key: &str,
+    make_src: F,
+) {
+    if heap.len() < limit {
+        heap.push(HeapItem {
+            prim,
+            key: key.into(),
+            src: make_src(),
+        });
+        return;
+    }
+    let worst = heap.peek().unwrap();
+    let better = prim
+        .cmp(&worst.prim)
+        .then_with(|| key.cmp(worst.key.as_ref()))
+        == CmpOrdering::Less;
+    if better {
+        heap.pop();
+        heap.push(HeapItem {
+            prim,
+            key: key.into(),
+            src: make_src(),
+        });
+    }
+}
+
+/// `out[i] = max(zone.max_ts)` over segments `i..` of an already newest-first
+/// meta list — the suffix bound driving timestamp-desc early termination.
+fn suffix_max_ts(metas: &[SegmentMeta]) -> Vec<i64> {
+    let mut out = vec![i64::MIN; metas.len()];
+    let mut acc = i64::MIN;
+    for i in (0..metas.len()).rev() {
+        acc = acc.max(metas[i].zone.max_ts);
+        out[i] = acc;
+    }
+    out
 }

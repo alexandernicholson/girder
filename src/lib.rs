@@ -44,5 +44,5 @@ mod wal;
 
 pub use engine::{Girder, GirderConfig, Stats};
 pub use error::{GirderError, Result};
-pub use record::{QuerySpec, Record};
+pub use record::{OrderBy, QuerySpec, Record};
 pub use wal::FsyncPolicy;

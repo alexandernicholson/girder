@@ -194,6 +194,7 @@ impl MaintenanceActor {
             MaintCall::Tick => {
                 let flushed = self.flush_pending()?;
                 self.compact()?;
+                self.reclaim_sealed()?;
                 self.tier()?;
                 self.groom()?;
                 self.migrate()?;
@@ -489,6 +490,219 @@ impl MaintenanceActor {
         }
 
         best.map(|run| run.into_iter().cloned().collect())
+    }
+
+    /// Sealed-segment reclamation (track F slice F3, rulings 8–12): the
+    /// documented cost of the byte-cap seal is that overwritten rows inside
+    /// sealed segments were reclaimed only by retention. This closes that
+    /// hole with a dead-ratio-triggered SOLO rewrite — sealed segments never
+    /// re-MERGE (that was the D1 unbounded-write-amp hole), they only ever
+    /// shrink in place.
+    ///
+    /// Bounded by construction:
+    ///
+    /// - **One audit per tick**, chosen by a rotating in-memory cursor over
+    ///   sealed hot segments (round-robin, not "most overlap", so an
+    ///   ineligible segment can never pin the audit forever). An audit reads
+    ///   KEY COLUMNS only — its own and newer overlapping segments' — never
+    ///   payloads or text. Candidates skippable from manifest METADATA alone
+    ///   (no newer overlapping segment exists) advance the rotation for free
+    ///   — the tick's single audit budget is spent on the first candidate
+    ///   that actually needs its key columns read, so reclaim latency scales
+    ///   with auditable segments, not with the total sealed population.
+    ///   Nothing is persisted (ruling 11): the audit recomputes honestly; a
+    ///   restart just restarts the rotation.
+    /// - A row is **dead** iff a strictly NEWER durable segment holds a
+    ///   NON-delta record for its key AND no newer durable segment holds a
+    ///   delta for it (a delta needs its base to fold — the same rule
+    ///   count()/compaction honor; ruling 8). Memtable/frozen shadowing is
+    ///   ignored (durable-only, ruling 10): it lands as a segment soon and
+    ///   is seen then. A row is never dropped because of what sits BELOW
+    ///   it — so a tombstone-convention record shadowing older versions
+    ///   always survives until it is itself shadowed by a newer version.
+    /// - **Rewrite only when `dead * 2 >= rows`** (f = 1/2, ruling 9 — the
+    ///   same half-the-cap style as `byte_seal`): each rewrite at least
+    ///   halves the segment, so one segment sees at most log2(rows) solo
+    ///   rewrites in its lifetime, and an overwrite-free corpus never trips
+    ///   the ratio at all (`fat_record_compaction_converges` is untouched by
+    ///   construction). A shrunken output below the seal simply rejoins
+    ///   ordinary compaction.
+    /// - The output takes the **same id slot** (groom's exact move):
+    ///   newest-wins positioning preserved; filenames come from the fresh
+    ///   never-reused seq. All-dead segments are dropped whole by manifest
+    ///   swap. Rewrite bytes count into `stats_bytes_compacted` — write-amp
+    ///   accounting stays honest.
+    /// - **Hot v2 only** (ruling 12): cold partially-dead segments wait
+    ///   (mirrors groom's documented cold deferral); v1-format segments wait
+    ///   for `migrate()`. Newer v1 segments contribute no shadow evidence
+    ///   (conservative: undercounting dead only delays reclaim).
+    fn reclaim_sealed(&self) -> Result<u64> {
+        use std::sync::atomic::Ordering;
+        let cap = self.inner.config.max_segment_records.max(1);
+        let byte_seal = (self.inner.config.max_segment_bytes / 2).max(1);
+
+        // Pick this tick's audit target + the newer overlapping evidence set
+        // under the read lock. "Sealed" is exactly choose_run's exclusion:
+        // hot and at either output cap. Rotation-order candidates that have
+        // NO newer overlapping segment are skipped from metadata alone (free
+        // — no file touched); the tick's one audit goes to the first
+        // candidate with actual evidence to read.
+        let Some((cand, newer)) = ({
+            let manifest = self.inner.manifest.read().unwrap();
+            let mut sealed: Vec<&SegmentMeta> = manifest
+                .segments
+                .iter()
+                .filter(|m| m.tier == Tier::Hot && (m.zone.count >= cap || m.bytes >= byte_seal))
+                .collect();
+            sealed.sort_by_key(|m| m.id);
+            let cursor = self.inner.reclaim_cursor.load(Ordering::Relaxed);
+            // Rotation order: ids above the cursor first, then wrap.
+            let (tail, head): (Vec<&&SegmentMeta>, Vec<&&SegmentMeta>) =
+                sealed.iter().partition(|m| m.id > cursor);
+            tail.into_iter().chain(head).find_map(|pick| {
+                let newer: Vec<SegmentMeta> = manifest
+                    .segments
+                    .iter()
+                    .filter(|m| m.id > pick.id)
+                    .filter(|m| {
+                        m.zone.min_key <= pick.zone.max_key && pick.zone.min_key <= m.zone.max_key
+                    })
+                    .cloned()
+                    .collect();
+                if newer.is_empty() {
+                    None // metadata-only skip: no row here can be dead
+                } else {
+                    Some(((*pick).clone(), newer))
+                }
+            })
+        }) else {
+            return Ok(0);
+        };
+        // Rotate FIRST: audited either way, the next tick moves on.
+        self.inner.reclaim_cursor.store(cand.id, Ordering::Relaxed);
+
+        let hot_dir = &self.inner.config.hot_dir;
+        let cold_dir = &self.inner.config.cold_dir;
+        // Audit I/O is maintenance, not the query path — scratch counter.
+        let scratch = std::sync::atomic::AtomicU64::new(0);
+
+        // The candidate's key column (v2 only; v1 waits for migrate()).
+        let cand_path = segment_path(hot_dir, cold_dir, &cand);
+        let cand_file = std::fs::File::open(&cand_path)?;
+        if segment::read_header(&cand_file, &scratch)? != 2 {
+            return Ok(0);
+        }
+        let cand_dir = segment::read_footer(&cand_file, &scratch)?;
+        let keys = segment::load_keys(&cand_file, &cand_dir, &scratch)?;
+        let total = keys.count();
+        if total == 0 {
+            return Ok(0);
+        }
+
+        // Shadow evidence, one newer segment at a time (keys + the delta
+        // label column only where the zone says deltas are possible).
+        let mut shadowed = vec![false; total];
+        let mut delta_over = vec![false; total];
+        for meta in &newer {
+            let path = segment_path(hot_dir, cold_dir, meta);
+            let file = std::fs::File::open(&path)?;
+            if segment::read_header(&file, &scratch)? != 2 {
+                continue; // v1 evidence skipped (conservative)
+            }
+            let dir = segment::read_footer(&file, &scratch)?;
+            let nkeys = segment::load_keys(&file, &dir, &scratch)?;
+            let deltas_possible = match meta.zone.labels.get(crate::record::DELTA_LABEL) {
+                Some(Some(values)) => values.contains("1"),
+                Some(None) => true,
+                None => false,
+            };
+            let delta_col = if deltas_possible {
+                Some(segment::load_label(
+                    &file,
+                    &dir,
+                    crate::record::DELTA_LABEL,
+                    &scratch,
+                )?)
+            } else {
+                None
+            };
+            let row_is_delta = |j: usize| -> bool {
+                match &delta_col {
+                    None => false,
+                    Some(segment::LabelColumn::Dict { dict, codes, .. }) => {
+                        let c = codes[j];
+                        c != 0 && dict[(c - 1) as usize] == "1"
+                    }
+                    Some(segment::LabelColumn::Plain { values }) => {
+                        values[j].as_deref() == Some("1")
+                    }
+                }
+            };
+            for i in 0..total {
+                if shadowed[i] && delta_over[i] {
+                    continue; // both facts known; nothing can change
+                }
+                if let Some(j) = nkeys.find(keys.key_at(i)) {
+                    if row_is_delta(j) {
+                        delta_over[i] = true;
+                    } else {
+                        shadowed[i] = true;
+                    }
+                }
+            }
+        }
+        let dead: Vec<bool> = (0..total).map(|i| shadowed[i] && !delta_over[i]).collect();
+        let dead_count = dead.iter().filter(|d| **d).count();
+        if dead_count * 2 < total {
+            return Ok(0); // below f = 1/2 — not worth a rewrite yet
+        }
+        drop(cand_file);
+
+        // Rewrite (or drop whole). The dead set is keyed, not row-indexed:
+        // `read_all_records` row order is the key order, but keying makes the
+        // retain independent of that invariant.
+        let dead_keys: HashSet<&str> = (0..total)
+            .filter(|&i| dead[i])
+            .map(|i| keys.key_at(i))
+            .collect();
+        let survivors: Vec<Record> = segment::read_all_records(&cand_path)?
+            .into_iter()
+            .filter(|r| !dead_keys.contains(r.key.as_str()))
+            .collect();
+        if survivors.is_empty() {
+            let mut manifest = self.inner.manifest.write().unwrap();
+            manifest.segments.retain(|s| s.id != cand.id);
+            self.inner.store_manifest(&manifest)?;
+            drop(manifest);
+            std::fs::remove_file(&cand_path).ok();
+            self.inner.cache.invalidate(cand.cache_key());
+        } else {
+            let seq = self.alloc_seq();
+            let file = seg_file(seq);
+            let out_path = hot_dir.join(&file);
+            let zone = segment::write_segment_presorted(&out_path, &survivors)?;
+            let bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            {
+                let mut manifest = self.inner.manifest.write().unwrap();
+                manifest.segments.retain(|s| s.id != cand.id);
+                manifest.segments.push(SegmentMeta {
+                    id: cand.id, // same recency slot: newest-wins order preserved
+                    file,
+                    tier: Tier::Hot,
+                    zone,
+                    bytes,
+                    created_unix_nanos: cand.created_unix_nanos,
+                });
+                self.inner.store_manifest(&manifest)?;
+            }
+            std::fs::remove_file(&cand_path).ok();
+            self.inner.cache.invalidate(cand.cache_key());
+            self.inner
+                .stats_bytes_compacted
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.inner.stats_reclaimed.fetch_add(1, Ordering::Relaxed);
+        Ok(1)
     }
 
     /// The compiled retention policy (config rows + the legacy global knob).

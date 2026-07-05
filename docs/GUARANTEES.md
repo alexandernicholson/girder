@@ -111,6 +111,30 @@ compaction or groom pass touches it (there is no read-time filter).
 Point deletes remain an embedder convention (tombstones) — retention is
 the only engine-level removal.
 
+## Sealed-segment reclamation
+
+Compaction seals a segment at either output cap (records, or half the byte
+cap) and never re-merges it — that bound is what keeps write amplification
+finite (see `docs/BENCH.md`, the D1 finding). The cost is that rows
+overwritten *after* their segment sealed are dead bytes. Those are
+reclaimed by a bounded background audit (`reclaim_sealed`, pinned by
+`tests/seal_reclaim.rs`):
+
+- One audit per tick, rotating over sealed hot segments; an audit reads
+  key columns only. A row is **dead** iff a strictly newer durable segment
+  holds a non-delta record for its key and no newer durable segment holds
+  a delta for it (a delta needs its base — the same fold rule compaction
+  and `count()` honor). A row is never judged by what sits *below* it, so
+  a tombstone-convention record shadowing older versions always survives
+  until it is itself shadowed.
+- A segment is rewritten (solo, same recency slot — never merged) only
+  when at least **half** its rows are dead, so each rewrite at least
+  halves it: bounded rewrites per segment lifetime, and an overwrite-free
+  corpus never triggers reclaim at all. Fully-dead segments are dropped
+  wholesale.
+- Hot v2 segments only: cold segments wait (mirroring the groomer's cold
+  deferral), v1-format segments wait for migration.
+
 ## Explicit non-guarantees
 
 These are deliberate; do not build on their absence being accidental.

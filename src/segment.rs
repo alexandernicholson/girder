@@ -250,8 +250,28 @@ pub struct KeysSection {
 
 impl KeysSection {
     #[inline]
-    fn key_at(&self, i: usize) -> &str {
+    pub(crate) fn key_at(&self, i: usize) -> &str {
         &self.blob[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+    /// Row count (named like [`SegmentColumns::count`], not `len`, on purpose).
+    pub(crate) fn count(&self) -> usize {
+        self.offsets.len() - 1
+    }
+    /// Binary search the (sorted, unique) key column — the keys-only twin of
+    /// [`SegmentColumns::find_key`], for callers that audit a segment without
+    /// assembling full columns (the seal-reclaim audit).
+    pub(crate) fn find(&self, key: &str) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.count();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.key_at(mid).cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
     }
     fn bytes(&self) -> u64 {
         self.blob.len() as u64 + (self.offsets.len() as u64) * 8 + 32

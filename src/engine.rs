@@ -93,6 +93,13 @@ pub struct EngineInner {
     pub stats_flushes: AtomicU64,
     pub stats_compactions: AtomicU64,
     pub stats_groomed: AtomicU64,
+    /// Sealed segments rewritten (or dropped whole) by the dead-ratio
+    /// reclaimer (track F slice F3).
+    pub stats_reclaimed: AtomicU64,
+    /// Rotating cursor of the seal-reclaim audit (last audited segment id).
+    /// In-memory only — a restart just restarts the rotation (ruling 11:
+    /// nothing persisted; the audit recomputes honestly).
+    pub reclaim_cursor: AtomicU64,
     pub stats_migrated: AtomicU64,
     pub stats_tiered: AtomicU64,
     /// Total bytes written by flushes (denominator for write amplification).
@@ -133,6 +140,10 @@ pub struct Stats {
     pub compactions: u64,
     /// Segments removed or rewritten by the retention groomer.
     pub groomed_segments: u64,
+    /// Sealed segments rewritten (or dropped whole) by the dead-ratio
+    /// reclaimer — overwritten rows evicted without re-merging sealed
+    /// segments (write-amp stays bounded; see `actors::reclaim_sealed`).
+    pub reclaimed_segments: u64,
     /// Legacy-format segments rewritten to the current format.
     pub migrated_segments: u64,
     /// Content-addressed blobs currently stored.
@@ -210,6 +221,8 @@ impl Girder {
             stats_flushes: AtomicU64::new(0),
             stats_compactions: AtomicU64::new(0),
             stats_groomed: AtomicU64::new(0),
+            stats_reclaimed: AtomicU64::new(0),
+            reclaim_cursor: AtomicU64::new(0),
             stats_migrated: AtomicU64::new(0),
             stats_tiered: AtomicU64::new(0),
             stats_bytes_flushed: AtomicU64::new(0),
@@ -1340,6 +1353,7 @@ impl Girder {
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
             groomed_segments: self.inner.stats_groomed.load(Ordering::Relaxed),
+            reclaimed_segments: self.inner.stats_reclaimed.load(Ordering::Relaxed),
             migrated_segments: self.inner.stats_migrated.load(Ordering::Relaxed),
             blobs: manifest.blobs.len(),
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),

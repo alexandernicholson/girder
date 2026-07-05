@@ -101,5 +101,10 @@ index answers in **441 ms** where the naive in-RAM scan takes **7.97 s** —
 top-k. The 10M build's exact ×10 linearity is the regression guard for the
 byte-cap seal (a record-count-only seal made this same build superlinear —
 1,135 segment writes for 1M records; see the `fat_record_compaction_converges`
-test). The broad (~17%) row is skipped above 2M spans, loudly, because the
-seam materializes full match sets.
+test). The seal's documented trade-off — overwritten rows in sealed
+segments reclaimable only via retention — is closed by the dead-ratio
+reclaimer (`docs/GUARANTEES.md` §Sealed-segment reclamation,
+`tests/seal_reclaim.rs`): solo rewrites at ≥½ dead, so the write-amp bound
+above survives overwrite-heavy workloads too. The broad (~17%) row is
+skipped above 2M spans, loudly, because the seam materializes full match
+sets.

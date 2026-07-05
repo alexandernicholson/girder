@@ -680,7 +680,7 @@ impl Girder {
                 }
                 continue;
             }
-            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
+            let (cols, file) = self.load_segment(&step.meta, need_tokens(spec))?;
             for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 let r = row as usize;
                 if !seen.contains(cols.key_at(r)) && !cols.is_tombstone_at(r) {
@@ -877,7 +877,7 @@ impl Girder {
             // One open file handle is held across this segment's whole
             // materialize loop, so a concurrent hot→cold rename can't tear the
             // per-row payload reads (the fd stays valid on unix).
-            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
+            let (cols, file) = self.load_segment(&step.meta, need_tokens(spec))?;
             let rows = cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)?;
             if !rows.is_empty() {
                 for &row in &rows {
@@ -1004,7 +1004,7 @@ impl Girder {
             }
             // Heap phase needs only the columns (keys/ts/order-numeric); the
             // file handle is reopened lazily for the surviving rows at drain.
-            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
+            let (cols, file) = self.load_segment(&step.meta, need_tokens(spec))?;
             for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 let r = row as usize;
                 let key = cols.key_at(r);
@@ -1575,6 +1575,19 @@ fn surface(record: Record) -> Option<Record> {
 /// The query's text tokens, when a text predicate is present.
 fn text_query_tokens(spec: &QuerySpec) -> Option<Vec<String>> {
     spec.text_match.as_deref().map(crate::text::fts_tokens)
+}
+
+/// Should the walk load K_TOKENS for this spec? `text_match` always; a
+/// `text_like` only when its prefix analysis yields usable constraints —
+/// an unanalyzable pattern never touches the index, so it must not pay
+/// for loading it. (The F2 bench caught the miss: keying this on
+/// `text_match` alone left every LIKE leg on the fallthrough walk.)
+fn need_tokens(spec: &QuerySpec) -> bool {
+    spec.text_match.is_some()
+        || spec
+            .text_like
+            .as_deref()
+            .is_some_and(|p| !crate::text::like_constraints(p).is_empty())
 }
 
 /// Memtable-phase matcher: field predicates via the oracle, `text_match` via

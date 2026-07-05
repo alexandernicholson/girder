@@ -305,6 +305,41 @@ fn main() {
         let (p50, hits) = warm_p50(7, || runtime_block(&engine, &fts_composed));
         println!("fts + label (composed)                     warm_p50={p50:.2?}  ({hits} hits, limit 50)");
 
+        // --- LIKE pushdown (track F, F2): prefix analysis over the token
+        // index. Accelerated shapes narrow through token/prefix constraints
+        // then verify against raw text; the bare %infix% shape derives NO
+        // constraint and pays the honest full-verify walk — both measured.
+        let like_prefix = QuerySpec {
+            text_like: Some("user asked about billing zebracorn%".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        let like_delimited = QuerySpec {
+            text_like: Some("% zebracorn case %".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        // NB: a bare single word between wildcards — `%zebracorn case%`
+        // would NOT fall through (the space makes `case` left-complete →
+        // a Prefix constraint; the analyzer is sharper than intuition).
+        let like_infix = QuerySpec {
+            text_like: Some("%zebracorn%".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &like_prefix));
+        println!(
+            "like anchored-prefix ('…zebracorn%', ~0.1%, accelerated)  warm_p50={p50:.2?}  ({hits} hits, limit 50)"
+        );
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &like_delimited));
+        println!(
+            "like delimited-infix ('% zebracorn case %', accelerated)  warm_p50={p50:.2?}  ({hits} hits, limit 50)"
+        );
+        let (p50, hits) = warm_p50(3, || runtime_block(&engine, &like_infix));
+        println!(
+            "like bare-infix ('%zebracorn%', fallthrough verify)        warm_p50={p50:.2?}  ({hits} hits, limit 50)"
+        );
+
         // --- put-ack latency under load (the durability ack: WAL append +
         // memtable insert, fsync/256), single puts, compaction racing. ---
         let mut acks: Vec<Duration> = Vec::with_capacity(5_000);

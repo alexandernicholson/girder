@@ -84,6 +84,30 @@ decode-once (`OnceLock`); the lazy layout's real target is the 10M shape
 (cold decode + memory), re-measured when the 10M soak rides the bench
 slice.
 
+### F2 LIKE-pushdown legs (2026-07-06, prefix analysis over K_TOKENS v2)
+
+New legs; same 1M corpus, measured on D7's code (same-run FTS-selective
+control 867 µs ≈ D7's 848 µs — comparable run). Accelerated shapes narrow
+through token/prefix constraints, then verify every candidate against the
+raw text (exactness never depends on the index); the bare `%infix%` shape
+derives no constraint and pays the full verify walk — kept in the table
+so the cost of the ledgered n-gram deferral stays visible.
+
+| leg | result |
+|---|---|
+| like anchored-prefix (`…zebracorn%`, ~0.1%, accelerated) | warm p50 **1.14 ms** |
+| like delimited-infix (`% zebracorn case %`, accelerated) | warm p50 **1.05 ms** |
+| like bare-infix (`%zebracorn%`, fallthrough full verify) | warm p50 **281 ms** |
+
+The accelerated/fallthrough gap (~250×) is the pushdown's value statement.
+Honesty note: the first F2 run measured all three legs at ~270 ms — the
+walk keyed K_TOKENS loading on `text_match` alone, so LIKE specs never saw
+the index (fixed: `need_tokens` consults the prefix analysis). And the
+original fallthrough leg pattern `%zebracorn case%` turned out to
+ACCELERATE (the interior space makes `case` a left-complete prefix
+fragment) — the analyzer is sharper than intuition; the leg now uses a
+truly constraint-free pattern.
+
 ## The rivet-seam baselines (search-bench, 2026-07-05)
 
 Cross-store numbers measured through rivet's `SearchIndex` seam

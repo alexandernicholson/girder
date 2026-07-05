@@ -177,6 +177,15 @@ const PATTERNS: &[&str] = &[
     // matches nothing anywhere
     "zzz-not-present%",
     "%zzz-not-present%",
+    // F2 analyzer edges: `_`-cut left-anchored prefix; interior delimited
+    // token inside %...% (accelerates); trailing prefix fragment; required
+    // token provably absent (empty-intersection fast path).
+    "usage_percent%",
+    "%CPU on shard%",
+    "% timeout %",
+    "% database TIMEOUT %",
+    "%error: database%30s",
+    "% zzzabsent %",
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -341,5 +350,54 @@ async fn text_like_on_textless_segment() {
             "pattern {p:?}"
         );
         assert_eq!(engine.count(&spec).await.unwrap(), 0, "count {p:?}");
+    }
+}
+
+/// F2 budget honesty (ruling 4): a prefix whose dictionary range exceeds
+/// the per-segment budget drops the constraint and falls back to the
+/// exact full-verify walk — same answers, never an error. 100 tokens
+/// share the prefix `tok` (budget is 64), plus enough distinct texts that
+/// the fallback actually has verification work to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_like_prefix_over_budget_falls_back_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Girder::open(config(dir.path())).await.unwrap();
+    let mut truth: BTreeMap<String, Record> = BTreeMap::new();
+    for i in 0..200usize {
+        // Even keys: a `tokNNN` word (100 distinct tokens with the shared
+        // prefix). Odd keys: unrelated text.
+        let text = if i % 2 == 0 {
+            format!("marker tok{:03} tail", i / 2)
+        } else {
+            format!("other body {i}")
+        };
+        let r = record(&format!("b/{i:04}"), i as i64, "m", 1.0, Some(&text));
+        truth.insert(r.key.clone(), r.clone());
+        engine.put(r).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    engine.maintain().await.unwrap();
+
+    // `%tok%`-shaped patterns that DERIVE a `tok` prefix constraint: the
+    // dictionary range (100 tokens) exceeds the 64 budget → dropped.
+    for p in ["%, tok%", "% tok%", "marker tok%"] {
+        let spec = QuerySpec {
+            text_like: Some(p.to_string()),
+            ..Default::default()
+        };
+        let got = keys(&engine.scan(&spec).await.unwrap());
+        assert_eq!(got, oracle(&truth, &spec), "pattern {p:?}");
+        assert_eq!(engine.count(&spec).await.unwrap(), got.len(), "count {p:?}");
+    }
+    // On the same corpus: `marker tok04%` derives an IN-budget prefix
+    // (`tok04` → 10 dictionary tokens) and narrows; `%tok04_ %` derives
+    // nothing (`%`-adjacent fragment) and falls back — both must agree.
+    for p in ["%tok04_ %", "marker tok04%"] {
+        let spec = QuerySpec {
+            text_like: Some(p.to_string()),
+            ..Default::default()
+        };
+        let got = keys(&engine.scan(&spec).await.unwrap());
+        assert_eq!(got, oracle(&truth, &spec), "pattern {p:?}");
     }
 }

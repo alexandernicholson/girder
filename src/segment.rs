@@ -359,13 +359,28 @@ enum Postings {
     },
 }
 
+/// A LIKE `Prefix` constraint's resolution against one segment's dictionary
+/// (F2, ruling 4).
+enum PrefixUnion {
+    /// The dictionary range exceeded the budget — constraint dropped, the
+    /// caller narrows by whatever else it has (never an error).
+    OverBudget,
+    /// No token starts with the prefix — provably no row matches.
+    Empty,
+    /// The ascending, deduped union of the range's postings.
+    Rows(Vec<u32>),
+}
+
+/// Ruling 4: a LIKE prefix constraint may expand to at most this many
+/// dictionary tokens per segment; beyond it the constraint is dropped
+/// (fall back, never error). Compile-time on purpose, like the seal
+/// constants — a knob nobody should tune per-deployment.
+const LIKE_PREFIX_BUDGET: usize = 64;
+
 impl TokenIndex {
-    fn postings_of(&self, token: &str) -> Option<&[u32]> {
-        let i = self
-            .tokens
-            .binary_search_by(|t| t.as_str().cmp(token))
-            .ok()?;
-        Some(match &self.postings {
+    /// Decoded postings of the token at dictionary index `i`.
+    fn postings_at(&self, i: usize) -> &[u32] {
+        match &self.postings {
             Postings::Eager(lists) => lists[i].as_slice(),
             Postings::Lazy {
                 blob,
@@ -377,7 +392,40 @@ impl TokenIndex {
                     decode_posting_list(&blob[off as usize..(off + len) as usize], nrows as usize)
                 })
                 .as_slice(),
-        })
+        }
+    }
+
+    fn postings_of(&self, token: &str) -> Option<&[u32]> {
+        let i = self
+            .tokens
+            .binary_search_by(|t| t.as_str().cmp(token))
+            .ok()?;
+        Some(self.postings_at(i))
+    }
+
+    /// Union of postings over the dictionary range of tokens starting with
+    /// `prefix` (tokens are sorted, so the range is contiguous), bounded by
+    /// `budget` dictionary tokens. Lazy postings decode only inside an
+    /// in-budget range — an over-budget range decodes NOTHING.
+    fn postings_union_of_prefix(&self, prefix: &str, budget: usize) -> PrefixUnion {
+        let start = self.tokens.partition_point(|t| t.as_str() < prefix);
+        let mut end = start;
+        while end < self.tokens.len() && self.tokens[end].starts_with(prefix) {
+            end += 1;
+            if end - start > budget {
+                return PrefixUnion::OverBudget;
+            }
+        }
+        if end == start {
+            return PrefixUnion::Empty;
+        }
+        let mut rows: Vec<u32> = Vec::new();
+        for i in start..end {
+            rows.extend_from_slice(self.postings_at(i));
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        PrefixUnion::Rows(rows)
     }
 
     /// Rows whose text contains ALL of `want` (AND-of-tokens), ascending.
@@ -444,6 +492,21 @@ impl TokenIndex {
             postings: Postings::Eager(postings),
         }
     }
+}
+
+/// Intersection of ascending row lists — the owned-list twin of
+/// [`TokenIndex::rows_matching_all`]'s strategy (walk the smallest, binary
+/// search the rest). Empty input ⇒ empty (callers never build a zero-list
+/// intersection meaning "everything").
+fn intersect_ascending(mut lists: Vec<Vec<u32>>) -> Vec<u32> {
+    let Some(min_idx) = (0..lists.len()).min_by_key(|&i| lists[i].len()) else {
+        return Vec::new();
+    };
+    let first = lists.swap_remove(min_idx);
+    first
+        .into_iter()
+        .filter(|row| lists.iter().all(|l| l.binary_search(row).is_ok()))
+        .collect()
 }
 
 /// Decode one validated varint-delta posting list (the lazy read path). The
@@ -658,18 +721,45 @@ impl SegmentColumns {
         let prefix = spec.key_prefix.as_deref();
         let time = spec.time;
 
-        // Text predicate: resolve through the token postings index. The
-        // candidate rows are EXACT for the text predicate (encode-time
-        // tokenizer == query tokenizer), so only the other predicates need
-        // checking per candidate. D7-a: candidates first merge against the
-        // blocks surviving the OTHER predicates' zone tests (both sides are
+        // Text predicates: resolve through the token postings index. The
+        // candidate rows are EXACT for `text_match` (encode-time tokenizer
+        // == query tokenizer) and a sound SUPERSET for `text_like` (F2: the
+        // pattern's token/prefix constraints narrow; the caller's verifier
+        // supplies exactness), so only the other predicates need checking
+        // per candidate. D7-a: candidates first merge against the blocks
+        // surviving the OTHER predicates' zone tests (both sides are
         // ascending, so it is one linear walk) — a COMMON token composed
         // with a selective time/label predicate no longer pays per-row
         // checks inside dead blocks.
-        if let Some(q) = &spec.text_match {
-            let want = crate::text::fts_tokens(q);
+        let like_lists = spec
+            .text_like
+            .as_deref()
+            .and_then(|p| self.like_candidate_lists(p));
+        if spec.text_match.is_some() || like_lists.is_some() {
             let Some(idx) = &self.tokens else {
                 return Vec::new(); // segment has no text at all
+            };
+            let cand_rows: Vec<u32> = match (&spec.text_match, like_lists) {
+                // text_match alone: the historical path, byte-identical.
+                (Some(q), None) => idx.rows_matching_all(&crate::text::fts_tokens(q)),
+                // like constraints, optionally AND text_match tokens: one
+                // generalized intersection over all the sorted lists.
+                (tm, Some(mut lists)) => {
+                    if let Some(q) = tm {
+                        let want = crate::text::fts_tokens(q);
+                        if want.is_empty() {
+                            return Vec::new(); // no tokens = no match
+                        }
+                        for t in &want {
+                            match idx.postings_of(t) {
+                                Some(l) => lists.push(l.to_vec()),
+                                None => return Vec::new(),
+                            }
+                        }
+                    }
+                    intersect_ascending(lists)
+                }
+                (None, None) => unreachable!("guarded by the arm condition"),
             };
             let live_blocks: Vec<&BlockMeta> = self
                 .blocks
@@ -678,7 +768,7 @@ impl SegmentColumns {
                 .collect();
             let mut block_iter = live_blocks.iter().peekable();
             let mut out: Vec<u32> = Vec::new();
-            'cand: for row in idx.rows_matching_all(&want) {
+            'cand: for row in cand_rows {
                 // Advance to the block that could hold `row`; a candidate
                 // before the next live block is inside a pruned one.
                 while let Some(b) = block_iter.peek() {
@@ -766,6 +856,43 @@ impl SegmentColumns {
             }
         }
         out
+    }
+
+    /// Resolve a LIKE pattern's sound token constraints (F2, rulings 2–4)
+    /// against this segment's dictionary into candidate row lists:
+    ///
+    /// - `None` — nothing usable (unanalyzable pattern, every prefix over
+    ///   budget, or no token index): the caller falls back to the full walk,
+    ///   which is exact via the verifier. Never an error.
+    /// - `Some(lists)` — intersect them; a provably-impossible constraint
+    ///   (required token absent, prefix range empty) is an empty list, which
+    ///   empties the intersection.
+    fn like_candidate_lists(&self, pattern: &str) -> Option<Vec<Vec<u32>>> {
+        let idx = self.tokens.as_ref()?;
+        let constraints = crate::text::like_constraints(pattern);
+        if constraints.is_empty() {
+            return None;
+        }
+        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(constraints.len());
+        for c in &constraints {
+            match c {
+                crate::text::LikeConstraint::Token(t) => match idx.postings_of(t) {
+                    Some(l) => lists.push(l.to_vec()),
+                    // A required token the segment lacks: no row can match.
+                    None => return Some(vec![Vec::new()]),
+                },
+                crate::text::LikeConstraint::Prefix(p) => {
+                    match idx.postings_union_of_prefix(p, LIKE_PREFIX_BUDGET) {
+                        PrefixUnion::OverBudget => {} // dropped (ruling 4)
+                        // No token starts with it: no row can match.
+                        PrefixUnion::Empty => return Some(vec![Vec::new()]),
+                        PrefixUnion::Rows(rows) => lists.push(rows),
+                    }
+                }
+            }
+        }
+        // Every constraint was budget-dropped → nothing narrows.
+        (!lists.is_empty()).then_some(lists)
     }
 
     fn block_may_match(&self, b: &BlockMeta, spec: &QuerySpec, dict_prune: &[(&str, u16)]) -> bool {

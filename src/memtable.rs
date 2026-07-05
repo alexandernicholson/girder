@@ -19,6 +19,10 @@ pub struct MemTable {
     key_tokens: HashMap<String, Vec<String>>,
     /// Resident delta-flagged records (their base may be in a segment).
     delta_keys: usize,
+    /// Conservative key range of every delta inserted since this memtable
+    /// was created (never shrunk on overwrite — a superset is safe; the
+    /// groomer only uses it to SKIP ranges).
+    delta_key_range: Option<(String, String)>,
 }
 
 impl MemTable {
@@ -40,6 +44,10 @@ impl MemTable {
         }
         if record.is_delta() {
             self.delta_keys += 1;
+            self.delta_key_range = Some(match self.delta_key_range.take() {
+                None => (record.key.clone(), record.key.clone()),
+                Some((lo, hi)) => (lo.min(record.key.clone()), hi.max(record.key.clone())),
+            });
         }
         let key = record.key.clone();
         if let Some(old_tokens) = self.key_tokens.remove(&key) {
@@ -89,6 +97,13 @@ impl MemTable {
     /// Are any delta-flagged records resident? (Fold-mode scan detection.)
     pub fn has_deltas(&self) -> bool {
         self.delta_keys > 0
+    }
+
+    /// Conservative key range of every delta ever inserted here (a superset
+    /// — never shrunk on overwrite). The groomer uses it to keep hands off
+    /// counter ranges.
+    pub fn delta_range(&self) -> Option<(String, String)> {
+        self.delta_key_range.clone()
     }
 
     /// Keys whose text contains ALL of `want` (AND-of-tokens) — the token-map

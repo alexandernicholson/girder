@@ -195,6 +195,7 @@ impl MaintenanceActor {
                 let flushed = self.flush_pending()?;
                 self.compact()?;
                 self.tier()?;
+                self.groom()?;
                 Ok(flushed)
             }
         }
@@ -312,10 +313,16 @@ impl MaintenanceActor {
                 }
             }
         }
-        // 3. Retention: drop expired records during the rewrite.
-        if let Some(ttl) = self.inner.config.retention_nanos {
-            let cutoff = now_nanos() - ttl;
-            merged.retain(|_, r| r.timestamp >= cutoff);
+        // 3. Retention: drop expired records during the rewrite — per-key,
+        //    longest-prefix wins, via the single RetentionPolicy oracle the
+        //    groomer shares.
+        let policy = self.retention_policy();
+        if !policy.is_empty() {
+            let now = now_nanos();
+            merged.retain(|key, r| match policy.cutoff_for_key(key, now) {
+                Some(cutoff) => r.timestamp >= cutoff,
+                None => true, // no matching row: keep forever
+            });
         }
         let records: Vec<Record> = merged.into_values().collect();
 
@@ -408,7 +415,9 @@ impl MaintenanceActor {
         // With retention off, a run of one segment is pure churn (no dedupe, no
         // eviction) → require >= 2 so single segments are never rewritten. With
         // retention on, allow a single segment so expired rows can be dropped.
-        let effective_min = if self.inner.config.retention_nanos.is_some() {
+        let effective_min = if self.inner.config.retention_nanos.is_some()
+            || !self.inner.config.retention.is_empty()
+        {
             min_seg
         } else {
             min_seg.max(2)
@@ -466,6 +475,182 @@ impl MaintenanceActor {
         }
 
         best.map(|run| run.into_iter().cloned().collect())
+    }
+
+    /// The compiled retention policy (config rows + the legacy global knob).
+    fn retention_policy(&self) -> crate::retention::RetentionPolicy {
+        crate::retention::RetentionPolicy::compile(
+            &self.inner.config.retention,
+            self.inner.config.retention_nanos,
+        )
+    }
+
+    /// Tick-driven retention grooming — expiry is not hostage to write
+    /// volume: with zero incoming writes, segments still age out.
+    ///
+    /// Two moves, both resolved through the SAME RetentionPolicy oracle
+    /// compaction uses:
+    ///
+    /// - **Wholesale drop** (any tier): a segment is provably all-expired
+    ///   from its zone map alone when (a) one policy row covers its whole
+    ///   key range (a lexicographic interval whose endpoints share a prefix
+    ///   consists entirely of keys sharing it — so every key has SOME row)
+    ///   and (b) `max_ts` is older than the LARGEST TTL of any row
+    ///   intersecting the range (so whichever longest-prefix row governs a
+    ///   key, that key is expired). Removed by manifest swap; the file is
+    ///   garbage.
+    /// - **Rewrite** (hot tier): same coverage condition, but only `min_ts`
+    ///   has passed the largest TTL — at least one record is provably
+    ///   expired, so the exact per-key rewrite always makes progress (no
+    ///   rewrite churn). Cold partially-expired segments wait for full
+    ///   expiry (documented; rewriting cold in place is deferred).
+    ///
+    /// Segments whose key range no single row covers are groomed only by
+    /// ordinary compaction (uncovered keys may be keep-forever).
+    fn groom(&self) -> Result<u64> {
+        let policy = self.retention_policy();
+        if policy.is_empty() {
+            return Ok(0);
+        }
+        let now = now_nanos();
+        // Counter safety: a fold spans sources, but the groomer judges one
+        // segment at a time — dropping an old BASE segment while a newer
+        // delta rides elsewhere would silently regress the counter (and
+        // dropping an expired delta while its base survives, likewise). So
+        // any segment whose key range overlaps delta presence ANYWHERE
+        // (its own zone label, another segment's, or the live memtables'
+        // conservative delta range) is skipped: counter ranges are groomed
+        // by compaction, which folds before it retains.
+        let delta_ranges: Vec<(String, String)> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            let mut ranges: Vec<(String, String)> = manifest
+                .segments
+                .iter()
+                .filter(|m| match m.zone.labels.get(crate::record::DELTA_LABEL) {
+                    Some(Some(values)) => values.contains("1"),
+                    Some(None) => true,
+                    None => false,
+                })
+                .map(|m| (m.zone.min_key.clone(), m.zone.max_key.clone()))
+                .collect();
+            if let Some(r) = self.inner.memtable.read().unwrap().delta_range() {
+                ranges.push(r);
+            }
+            for (_, map) in self.inner.frozen.read().unwrap().iter() {
+                if let Some(r) = map.delta_range() {
+                    ranges.push(r);
+                }
+            }
+            ranges
+        };
+        let overlaps_deltas = |min_key: &str, max_key: &str| {
+            delta_ranges
+                .iter()
+                .any(|(lo, hi)| lo.as_str() <= max_key && min_key <= hi.as_str())
+        };
+        let candidates: Vec<SegmentMeta> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            manifest
+                .segments
+                .iter()
+                .filter(|m| !overlaps_deltas(&m.zone.min_key, &m.zone.max_key))
+                .filter(|m| policy.covers_range(&m.zone.min_key, &m.zone.max_key))
+                .filter(|m| {
+                    let Some(max_ttl) = policy.max_ttl_in_range(&m.zone.min_key, &m.zone.max_key)
+                    else {
+                        return false;
+                    };
+                    let cutoff = now.saturating_sub(max_ttl);
+                    // Fully expired, or (hot only) provably partially expired.
+                    m.zone.max_ts < cutoff || (m.tier == Tier::Hot && m.zone.min_ts < cutoff)
+                })
+                .cloned()
+                .collect()
+        };
+        let mut groomed = 0;
+        for meta in candidates {
+            let max_ttl = policy
+                .max_ttl_in_range(&meta.zone.min_key, &meta.zone.max_key)
+                .expect("candidate has intersecting rows");
+            let all_expired = meta.zone.max_ts < now.saturating_sub(max_ttl);
+            if all_expired {
+                // Manifest swap first (source of truth), then the file is garbage.
+                {
+                    let mut manifest = self.inner.manifest.write().unwrap();
+                    manifest.segments.retain(|s| s.id != meta.id);
+                    self.inner.store_manifest(&manifest)?;
+                }
+                std::fs::remove_file(segment_path(
+                    &self.inner.config.hot_dir,
+                    &self.inner.config.cold_dir,
+                    &meta,
+                ))
+                .ok();
+                self.inner.cache.invalidate(meta.cache_key());
+                groomed += 1;
+                continue;
+            }
+            // Exact rewrite: fold deltas, per-key retain, same recency slot.
+            let path = segment_path(
+                &self.inner.config.hot_dir,
+                &self.inner.config.cold_dir,
+                &meta,
+            );
+            let mut merged: BTreeMap<String, Record> = BTreeMap::new();
+            for record in segment::read_all_records(&path)? {
+                if record.is_delta() {
+                    let folded = crate::record::merge_delta(merged.get(&record.key), &record);
+                    merged.insert(record.key.clone(), folded);
+                } else {
+                    merged.insert(record.key.clone(), record);
+                }
+            }
+            merged.retain(|key, r| match policy.cutoff_for_key(key, now) {
+                Some(cutoff) => r.timestamp >= cutoff,
+                None => true,
+            });
+            if merged.len() == meta.zone.count {
+                continue; // nothing actually expired (zone bound was loose)
+            }
+            if merged.is_empty() {
+                let mut manifest = self.inner.manifest.write().unwrap();
+                manifest.segments.retain(|s| s.id != meta.id);
+                self.inner.store_manifest(&manifest)?;
+                drop(manifest);
+                std::fs::remove_file(&path).ok();
+                self.inner.cache.invalidate(meta.cache_key());
+                groomed += 1;
+                continue;
+            }
+            let records: Vec<Record> = merged.into_values().collect();
+            let seq = self.alloc_seq();
+            let file = seg_file(seq);
+            let out_path = self.inner.config.hot_dir.join(&file);
+            let zone = segment::write_segment_presorted(&out_path, &records)?;
+            let bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            {
+                let mut manifest = self.inner.manifest.write().unwrap();
+                manifest.segments.retain(|s| s.id != meta.id);
+                manifest.segments.push(SegmentMeta {
+                    id: meta.id, // same recency slot: newest-wins order preserved
+                    file,
+                    tier: Tier::Hot,
+                    zone,
+                    bytes,
+                    created_unix_nanos: meta.created_unix_nanos,
+                });
+                self.inner.store_manifest(&manifest)?;
+            }
+            std::fs::remove_file(&path).ok();
+            self.inner.cache.invalidate(meta.cache_key());
+            groomed += 1;
+        }
+        if groomed > 0 {
+            self.inner
+                .stats_groomed
+                .fetch_add(groomed, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(groomed)
     }
 
     /// Move hot segments past `hot_ttl` to the cold tier.

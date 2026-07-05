@@ -63,6 +63,11 @@ construction, not by lock choreography:
   intersects postings for exact AND-of-tokens matches (case-insensitive) —
   no post-scan, no payload decode. `QuerySpec::matches` is the naive oracle
   the index provably agrees with (`tests/text_search.rs`).
+- **Retention & grooming**: per-key-prefix TTLs as policy-as-data
+  (`retention: Vec<(prefix, ttl_nanos)>`, longest-prefix wins; the global
+  `retention_nanos` knob is the match-all row). Enforced exactly at
+  compaction and proactively by a tick-driven groomer — segments age out
+  with zero incoming writes. See `docs/GUARANTEES.md` §Retention.
 - **Counters**: `incr(key, ts, deltas)` — atomic numeric increments through
   the single writer (concurrent increments never lose an update), folded by
   one merge oracle across memtable/read/compaction/WAL-replay; ordinary
@@ -127,8 +132,8 @@ let hits = engine.scan(&QuerySpec {
 ```
 
 `GirderConfig` knobs: `fsync`, `memtable_max_records`, `cache_bytes`,
-`compact_min_segments`, `hot_ttl_nanos`, `retention_nanos`, `tick_interval`,
-`hot_dir` / `cold_dir`.
+`compact_min_segments`, `hot_ttl_nanos`, `retention_nanos`, `retention`
+(per-prefix TTL rows), `tick_interval`, `hot_dir` / `cold_dir`.
 
 ## Tests
 

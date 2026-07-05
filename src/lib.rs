@@ -40,6 +40,7 @@ mod error;
 mod manifest;
 mod memtable;
 mod record;
+mod retention;
 mod segment;
 pub mod text;
 mod wal;

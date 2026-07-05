@@ -61,6 +61,36 @@ and WAL replay — so **concurrent increments never lose an update**
   limits apply to FOLDED totals only — **partial values must never rank**
   (a raw delta never matches a filter, orders a page, or leaks out).
 
+## Retention & grooming
+
+Retention is policy-as-data: `GirderConfig.retention` is a list of
+`(key_prefix, ttl_nanos)` rows (the legacy global `retention_nanos` knob
+folds in as the `""` match-all row; an explicit `""` row overrides it).
+Resolution is **longest-prefix wins**; duplicate prefixes fold
+last-entry-wins; a key matching no row is **kept forever**. One oracle
+(`RetentionPolicy`) resolves TTLs for both enforcement points:
+
+- **Compaction** retains per key, exactly, after delta folding — an active
+  counter (folded timestamp = latest activity) is never expired by an old
+  base.
+- **The tick-driven groomer** ages segments out with ZERO incoming writes:
+  a segment provably all-expired from its zone map alone is dropped
+  wholesale (any tier, manifest swap first — files are garbage); a
+  provably partially-expired HOT segment is rewritten in place (per-key
+  exact retain, same recency slot, guaranteed progress — never churn).
+  Cold partially-expired segments wait for full expiry. The groomer
+  **never touches a key range where counter deltas exist** (its own zone,
+  another segment's, or the live memtables') — a fold spans sources, and
+  judging one segment in isolation could drop a counter's base; counter
+  ranges are groomed by compaction, which folds first. An INACTIVE
+  counter — no live deltas, folded timestamp past its TTL — is ordinary
+  expired data and may be dropped; a later increment starts a fresh row.
+
+Expiry is lazy: an expired record may remain readable until the next
+compaction or groom pass touches it (there is no read-time filter).
+Point deletes remain an embedder convention (tombstones) — retention is
+the only engine-level removal.
+
 ## Explicit non-guarantees
 
 These are deliberate; do not build on their absence being accidental.

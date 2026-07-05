@@ -44,7 +44,14 @@ pub struct GirderConfig {
     /// Age (nanos) after which segments move to the cold tier.
     pub hot_ttl_nanos: i64,
     /// Drop records older than this at compaction (None = keep forever).
+    /// Legacy global knob — folds into `retention` as the `""` (match-all)
+    /// row; an explicit `""` row in `retention` overrides it.
     pub retention_nanos: Option<i64>,
+    /// Per-key-prefix retention: `(prefix, ttl_nanos)` rows, policy-as-data.
+    /// Longest matching prefix governs a key; keys matching no row are kept
+    /// forever. Enforced exactly at compaction and proactively by the
+    /// tick-driven groomer (`docs/GUARANTEES.md` §Retention).
+    pub retention: Vec<(String, i64)>,
     /// Background maintenance cadence.
     pub tick_interval: Duration,
 }
@@ -63,6 +70,7 @@ impl GirderConfig {
             max_segment_bytes: 256 * 1024 * 1024,
             hot_ttl_nanos: 24 * 3600 * 1_000_000_000,
             retention_nanos: None,
+            retention: Vec::new(),
             tick_interval: Duration::from_secs(5),
         }
     }
@@ -84,6 +92,7 @@ pub struct EngineInner {
     pub stats_puts: AtomicU64,
     pub stats_flushes: AtomicU64,
     pub stats_compactions: AtomicU64,
+    pub stats_groomed: AtomicU64,
     pub stats_tiered: AtomicU64,
     /// Total bytes written by flushes (denominator for write amplification).
     pub stats_bytes_flushed: AtomicU64,
@@ -121,6 +130,8 @@ pub struct Stats {
     pub total_records_in_segments: usize,
     pub flushes: u64,
     pub compactions: u64,
+    /// Segments removed or rewritten by the retention groomer.
+    pub groomed_segments: u64,
     pub tiered: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -193,6 +204,7 @@ impl Girder {
             stats_puts: AtomicU64::new(0),
             stats_flushes: AtomicU64::new(0),
             stats_compactions: AtomicU64::new(0),
+            stats_groomed: AtomicU64::new(0),
             stats_tiered: AtomicU64::new(0),
             stats_bytes_flushed: AtomicU64::new(0),
             stats_bytes_compacted: AtomicU64::new(0),
@@ -1149,6 +1161,7 @@ impl Girder {
             total_records_in_segments: manifest.segments.iter().map(|s| s.zone.count).sum(),
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
+            groomed_segments: self.inner.stats_groomed.load(Ordering::Relaxed),
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),
             cache_hits: self.inner.stats_cache_hits.load(Ordering::Relaxed),
             cache_misses: self.inner.stats_cache_misses.load(Ordering::Relaxed),

@@ -86,3 +86,13 @@ rivet's own `scv/format` marker with a one-shot restart-safe upgrade pass
 (marker written last; reads fall back to full scan until it says
 upgraded). Changing that set means a new marker version + a new pass on
 the rivet side; nothing about it is engine format.
+
+The second instance (rivet plan 0013 §6 D-2): span records in the `s/`
+namespace carry a PINNED annotation-dim set — presence label
+`annotation.<name>`="1" whenever a folded annotation attribute of either
+form exists, label dim `annotation.<name>.label`, numeric dim
+`annotation.<name>.score` (written, unpushed in v1) — versioned by
+rivet's `m/annotation-dims` marker with a source-independent one-shot
+upgrade pass (marker written last; unarmed stores read via full
+post-filter until it says upgraded). Spellings are owned by
+`rivet_core::feedback`, both directions.

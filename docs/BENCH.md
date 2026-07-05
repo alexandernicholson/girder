@@ -182,6 +182,12 @@ skips the text column when the caller doesn't verify text (`text_like`
 verification is the only reader). Neither engine-native leg regressed
 (D7/D8 1M tables above); the disk win stands.
 
+**SUPERSEDED for the fts legs (F-2b, next table):** `omit_text` landed
+and the fts legs did NOT move — the discarded-text attribution above is
+falsified for them (it stands for the materialize-heavy `recent` shape).
+F-2's controls isolate the fts movement to text-column machinery on the
+VERIFY path; chased as D-3 (rivet memory 0070 addendum / 0071).
+
 ### 10M soak, omit_text (2026-07-06, seam sets `QuerySpec.omit_text` — rivet memory 0071)
 
 Same box, girder rev `990bbbb` resolved from the public remote, seam legs:

@@ -100,7 +100,7 @@ impl GenServer for WriterActor {
                 {
                     let mut memtable = self.inner.memtable.write().unwrap();
                     for record in records {
-                        memtable.insert(record.key.clone(), record);
+                        memtable.insert(record);
                     }
                 }
                 self.inner.note_put();

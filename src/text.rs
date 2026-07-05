@@ -18,6 +18,20 @@ pub fn fts_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// AND-of-tokens match: does `text` contain every token in `want`?
+/// `want` empty ⇒ false (no tokens = no match); `text` None ⇒ false.
+/// This is the naive evaluation the token index must agree with.
+pub fn text_contains_all(text: Option<&str>, want: &[String]) -> bool {
+    if want.is_empty() {
+        return false;
+    }
+    let Some(text) = text else {
+        return false;
+    };
+    let have: std::collections::HashSet<String> = fts_tokens(text).into_iter().collect();
+    want.iter().all(|t| have.contains(t))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,6 +13,7 @@ use crate::actors::{MaintCall, MaintenanceActor, WriterActor, WriterMsg};
 use crate::cache::SegmentCache;
 use crate::error::{GirderError, Result};
 use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier};
+use crate::memtable::MemTable;
 use crate::record::{OrderBy, QuerySpec, Record};
 use crate::segment::{
     self, BlockMeta, KeysSection, LabelColumn, NumericColumn, PayloadIndex, Section, SectionId,
@@ -68,12 +69,12 @@ impl GirderConfig {
 }
 
 /// A frozen (immutable, flush-pending) memtable and the WAL seq covering it.
-pub type FrozenMemtable = (u64, Arc<BTreeMap<String, Record>>);
+pub type FrozenMemtable = (u64, Arc<MemTable>);
 
 /// Shared engine internals (actors + facade all hold this).
 pub struct EngineInner {
     pub config: GirderConfig,
-    pub memtable: RwLock<BTreeMap<String, Record>>,
+    pub memtable: RwLock<MemTable>,
     /// Frozen memtables awaiting flush.
     pub frozen: RwLock<Vec<FrozenMemtable>>,
     pub manifest: RwLock<Manifest>,
@@ -174,7 +175,7 @@ impl Girder {
         let next_wal_seq = wal_seqs.last().map(|s| s + 1).unwrap_or(0);
 
         let inner = Arc::new(EngineInner {
-            memtable: RwLock::new(BTreeMap::new()),
+            memtable: RwLock::new(MemTable::default()),
             frozen: RwLock::new(Vec::new()),
             manifest: RwLock::new(manifest),
             cache: SegmentCache::new(config.cache_bytes),
@@ -348,7 +349,7 @@ impl Girder {
         };
         // Newest-id first: the first segment that holds the key wins.
         for meta in self.pruned_segments(&spec) {
-            let (cols, file) = self.load_segment(&meta)?;
+            let (cols, file) = self.load_segment(&meta, false)?;
             if let Some(idx) = cols.find_key(key) {
                 return Ok(Some(cols.materialize(
                     idx,
@@ -389,13 +390,15 @@ impl Girder {
     fn scan_full(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<Record> = Vec::new();
+        let want = text_query_tokens(spec);
 
         // Recency order: memtable → frozen (newest first) seed `seen` with all
         // their keys (matching or not) so they shadow older segment versions.
         {
             let memtable = self.inner.memtable.read().unwrap();
+            let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for record in memtable.values() {
-                if seen.insert(record.key.clone()) && spec.matches(record) {
+                if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
                     out.push(record.clone());
                 }
             }
@@ -403,8 +406,9 @@ impl Girder {
         {
             let frozen = self.inner.frozen.read().unwrap();
             for (_, map) in frozen.iter().rev() {
+                let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for record in map.values() {
-                    if seen.insert(record.key.clone()) && spec.matches(record) {
+                    if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
                         out.push(record.clone());
                     }
                 }
@@ -424,7 +428,7 @@ impl Girder {
             // One open file handle is held across this segment's whole
             // materialize loop, so a concurrent hot→cold rename can't tear the
             // per-row payload reads (the fd stays valid on unix).
-            let (cols, file) = self.load_segment(meta)?;
+            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
             let rows = cols.matching_rows(spec);
             if !rows.is_empty() {
                 for &row in &rows {
@@ -482,14 +486,16 @@ impl Girder {
 
         let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(limit + 1);
         let mut seen: HashSet<String> = HashSet::new();
+        let want = text_query_tokens(spec);
 
         // Phase 1: newest sources (memtable → frozen). Guards are held only for
         // this in-memory pass, never across segment I/O.
         {
             let memtable = self.inner.memtable.read().unwrap();
+            let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for rec in memtable.values() {
                 let fresh = seen.insert(rec.key.clone());
-                if fresh && spec.matches(rec) {
+                if fresh && mem_matches(spec, rec, cand.as_ref()) {
                     let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                     let prim = make_prim(order, rec.timestamp, num);
                     offer(&mut heap, limit, prim, &rec.key, || {
@@ -501,9 +507,10 @@ impl Girder {
         {
             let frozen = self.inner.frozen.read().unwrap();
             for (_, map) in frozen.iter().rev() {
+                let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for rec in map.values() {
                     let fresh = seen.insert(rec.key.clone());
-                    if fresh && spec.matches(rec) {
+                    if fresh && mem_matches(spec, rec, cand.as_ref()) {
                         let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                         let prim = make_prim(order, rec.timestamp, num);
                         offer(&mut heap, limit, prim, &rec.key, || {
@@ -527,7 +534,7 @@ impl Girder {
             }
             // Heap phase needs only the columns (keys/ts/order-numeric); the
             // file handle is reopened lazily for the surviving rows at drain.
-            let (cols, _file) = self.load_segment(meta)?;
+            let (cols, _file) = self.load_segment(meta, spec.text_match.is_some())?;
             for &row in &cols.matching_rows(spec) {
                 let r = row as usize;
                 let key = cols.key_at(r);
@@ -599,6 +606,7 @@ impl Girder {
     fn load_segment(
         &self,
         meta: &crate::manifest::SegmentMeta,
+        need_tokens: bool,
     ) -> Result<(Arc<SegmentColumns>, Option<std::fs::File>)> {
         // Cache identity is the never-reused file seq, NOT `meta.id` —
         // compaction reuses ids for its outputs (see SegmentMeta::cache_key).
@@ -648,6 +656,11 @@ impl Girder {
         let blocks = self.section_blocks(id, &dir, &file, &mut disk)?;
         let payload_index = self.section_payload_index(id, &dir, &file, &mut disk)?;
         let text_index = self.section_text_index(id, &dir, &file, &mut disk)?;
+        let tokens = if need_tokens {
+            self.section_tokens(id, &dir, &file, &mut disk)?
+        } else {
+            None
+        };
         let mut labels = BTreeMap::new();
         for name in dir.label_names() {
             let col = self.section_label(id, &dir, &file, &name, &mut disk)?;
@@ -673,6 +686,7 @@ impl Girder {
             blocks,
             payload_index,
             text_index,
+            tokens,
         ));
         Ok((cols, Some(file)))
     }
@@ -796,6 +810,27 @@ impl Girder {
         *disk = true;
         let t = Arc::new(t);
         self.cache_put(id, SectionId::TextIndex, Section::TextIndex(Arc::clone(&t)));
+        Ok(Some(t))
+    }
+
+    /// Decoded token postings index; `None` when the segment has no K_TOKENS
+    /// section (absence re-derived from the cached directory — no I/O).
+    fn section_tokens(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Option<Arc<segment::TokenIndex>>> {
+        if let Some(Section::Tokens(t)) = self.inner.cache.get(id, SectionId::Tokens) {
+            return Ok(Some(t));
+        }
+        let Some(t) = segment::load_tokens(file, dir, &self.inner.stats_bytes_read)? else {
+            return Ok(None);
+        };
+        *disk = true;
+        let t = Arc::new(t);
+        self.cache_put(id, SectionId::Tokens, Section::Tokens(Arc::clone(&t)));
         Ok(Some(t))
     }
 
@@ -937,6 +972,25 @@ impl Girder {
             .map_err(|_| GirderError::ShutDown)?
             .ok();
         Ok(())
+    }
+}
+
+/// The query's text tokens, when a text predicate is present.
+fn text_query_tokens(spec: &QuerySpec) -> Option<Vec<String>> {
+    spec.text_match.as_deref().map(crate::text::fts_tokens)
+}
+
+/// Memtable-phase matcher: field predicates via the oracle, text via the
+/// pre-intersected token-map candidate set (equal to the naive text check by
+/// construction — same tokenizer at insert; pinned by the agreement tests).
+fn mem_matches(
+    spec: &QuerySpec,
+    record: &Record,
+    cand: Option<&std::collections::HashSet<&str>>,
+) -> bool {
+    match cand {
+        None => spec.matches(record),
+        Some(c) => c.contains(record.key.as_str()) && spec.matches_fields(record),
     }
 }
 

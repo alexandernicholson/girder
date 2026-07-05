@@ -57,6 +57,12 @@ construction, not by lock choreography:
   (tmp→fsync→rename); anything not in it is garbage.
 - **Stats**: puts, flushes, compactions, tiering moves, cache hit/miss,
   per-tier segment counts.
+- **Full-text search**: an optional `Record.text` document (caller-supplied;
+  the payload stays opaque) is tokenized at write time into a per-segment
+  token postings index + an in-memtable token map; `QuerySpec.text_match`
+  intersects postings for exact AND-of-tokens matches (case-insensitive) —
+  no post-scan, no payload decode. `QuerySpec::matches` is the naive oracle
+  the index provably agrees with (`tests/text_search.rs`).
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
 ## Upsert / merge semantics (public guarantee)

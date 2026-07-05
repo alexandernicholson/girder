@@ -79,6 +79,11 @@ const K_BLOCKS: u8 = 5;
 /// only when at least one record carries text, so text-less segments stay
 /// byte-identical to the pre-text format.
 const K_TEXT: u8 = 6;
+/// Token postings index over `Record.text` (the FTS index): sorted token
+/// dictionary + per-token ascending row ids (LEB128 delta-varint). Written
+/// alongside K_TEXT; rebuilt from merged rows at every compaction by
+/// construction (the encoder derives it from the records it is given).
+const K_TOKENS: u8 = 7;
 
 fn corrupt(detail: impl Into<String>) -> GirderError {
     GirderError::Corrupt {
@@ -280,6 +285,77 @@ impl TextIndex {
     }
 }
 
+/// The token postings index of one segment (K_TOKENS, decoded): for each
+/// distinct text token (sorted), the ascending row ids whose text contains
+/// it. Lookup is a binary search; a `text_match` is the intersection of its
+/// query tokens' postings — exact rows, no post-verification needed, because
+/// the tokenizer at encode time IS the query tokenizer (`text::fts_tokens`).
+pub struct TokenIndex {
+    tokens: Vec<String>,
+    postings: Vec<Vec<u32>>,
+}
+
+impl TokenIndex {
+    fn postings_of(&self, token: &str) -> Option<&[u32]> {
+        self.tokens
+            .binary_search_by(|t| t.as_str().cmp(token))
+            .ok()
+            .map(|i| self.postings[i].as_slice())
+    }
+
+    /// Rows whose text contains ALL of `want` (AND-of-tokens), ascending.
+    /// `want` empty ⇒ empty (no tokens = no match); any unknown token ⇒ empty.
+    pub fn rows_matching_all(&self, want: &[String]) -> Vec<u32> {
+        if want.is_empty() {
+            return Vec::new();
+        }
+        let mut lists: Vec<&[u32]> = Vec::with_capacity(want.len());
+        for t in want {
+            match self.postings_of(t) {
+                Some(l) => lists.push(l),
+                None => return Vec::new(),
+            }
+        }
+        lists.sort_by_key(|l| l.len());
+        let (first, rest) = lists.split_first().expect("want is non-empty");
+        first
+            .iter()
+            .copied()
+            .filter(|row| rest.iter().all(|l| l.binary_search(row).is_ok()))
+            .collect()
+    }
+
+    fn bytes(&self) -> u64 {
+        let mut n = 64u64;
+        for (t, p) in self.tokens.iter().zip(&self.postings) {
+            n += t.len() as u64 + 24 + (p.len() as u64) * 4 + 24;
+        }
+        n
+    }
+
+    /// Build from records (encode path + the v1/in-memory column path).
+    fn build<R: Borrow<Record>>(records: &[R]) -> TokenIndex {
+        let mut map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for (i, r) in records.iter().enumerate() {
+            if let Some(text) = &r.borrow().text {
+                let mut distinct = crate::text::fts_tokens(text);
+                distinct.sort_unstable();
+                distinct.dedup();
+                for t in distinct {
+                    map.entry(t).or_default().push(i as u32);
+                }
+            }
+        }
+        let mut tokens = Vec::with_capacity(map.len());
+        let mut postings = Vec::with_capacity(map.len());
+        for (t, p) in map {
+            tokens.push(t);
+            postings.push(p); // ascending by construction (row order)
+        }
+        TokenIndex { tokens, postings }
+    }
+}
+
 /// How row texts are sourced when materializing a `Record`. `None` on the
 /// containing [`SegmentColumns`] means the segment carries no text at all
 /// (pre-text file, or no record had text) — honest absence, not empty.
@@ -311,6 +387,7 @@ pub struct SegmentColumns {
     blocks: Arc<Vec<BlockMeta>>,
     payloads: Payloads,
     texts: Option<Texts>,
+    tokens: Option<Arc<TokenIndex>>,
 }
 
 impl SegmentColumns {
@@ -421,6 +498,49 @@ impl SegmentColumns {
         }
         let prefix = spec.key_prefix.as_deref();
         let time = spec.time;
+
+        // Text predicate: resolve through the token postings index. The
+        // candidate rows are EXACT for the text predicate (encode-time
+        // tokenizer == query tokenizer), so only the other predicates need
+        // checking per candidate — and a text query skips the block walk
+        // entirely (text is selective; candidates are already few).
+        if let Some(q) = &spec.text_match {
+            let want = crate::text::fts_tokens(q);
+            let Some(idx) = &self.tokens else {
+                return Vec::new(); // segment has no text at all
+            };
+            let mut out: Vec<u32> = Vec::new();
+            'cand: for row in idx.rows_matching_all(&want) {
+                let i = row as usize;
+                if let Some((lo, hi)) = time {
+                    let t = self.timestamps[i];
+                    if t < lo || t > hi {
+                        continue;
+                    }
+                }
+                if let Some(p) = prefix {
+                    if !self.key_at(i).starts_with(p) {
+                        continue;
+                    }
+                }
+                for lr in &lreqs {
+                    let hit = match lr {
+                        LReq::Code(codes, c) => codes[i] == *c,
+                        LReq::Plain(values, want) => values[i].as_deref() == Some(*want),
+                    };
+                    if !hit {
+                        continue 'cand;
+                    }
+                }
+                for (nc, lo, hi) in &nreqs {
+                    if !(nc.present[i] && nc.values[i] >= *lo && nc.values[i] <= *hi) {
+                        continue 'cand;
+                    }
+                }
+                out.push(row);
+            }
+            return out;
+        }
 
         let mut out: Vec<u32> = Vec::new();
         for block in self.blocks.iter() {
@@ -617,6 +737,7 @@ impl SegmentColumns {
 
         let blocks = build_blocks(&records, &plans);
         let any_text = records.iter().any(|r| r.text.is_some());
+        let tokens = any_text.then(|| Arc::new(TokenIndex::build(&records)));
         let mut texts_vec: Vec<Option<String>> = Vec::with_capacity(count);
         let payloads = Payloads::Mem(Arc::new(
             records
@@ -637,6 +758,7 @@ impl SegmentColumns {
             blocks: Arc::new(blocks),
             payloads,
             texts,
+            tokens,
         }
     }
 
@@ -652,6 +774,7 @@ impl SegmentColumns {
         blocks: Arc<Vec<BlockMeta>>,
         payload_index: Arc<PayloadIndex>,
         text_index: Option<Arc<TextIndex>>,
+        tokens: Option<Arc<TokenIndex>>,
     ) -> SegmentColumns {
         SegmentColumns {
             count,
@@ -662,6 +785,7 @@ impl SegmentColumns {
             blocks,
             payloads: Payloads::File(payload_index),
             texts: text_index.map(Texts::File),
+            tokens,
         }
     }
 }
@@ -718,6 +842,8 @@ pub enum SectionId {
     Numeric(String),
     /// The text offset table (K_TEXT header; blob bytes are never cached).
     TextIndex,
+    /// The decoded token postings index (K_TOKENS).
+    Tokens,
     /// A whole v1 (legacy) segment decoded in memory — v1 is not
     /// section-structured, so it is cached as one entry.
     V1Whole,
@@ -735,6 +861,7 @@ pub enum Section {
     Label(Arc<LabelColumn>),
     Numeric(Arc<NumericColumn>),
     TextIndex(Arc<TextIndex>),
+    Tokens(Arc<TokenIndex>),
     V1Whole(Arc<SegmentColumns>),
 }
 
@@ -751,6 +878,7 @@ impl Section {
             Section::Label(l) => label_bytes(l),
             Section::Numeric(n) => numeric_bytes(n),
             Section::TextIndex(t) => t.bytes(),
+            Section::Tokens(t) => t.bytes(),
             Section::V1Whole(c) => c.heap_bytes(),
         }
     }
@@ -1030,6 +1158,96 @@ fn encode_texts<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
     body
 }
 
+fn varint_push(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn varint_read(c: &mut Cur) -> Result<u32> {
+    let mut v: u32 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = c.u8()?;
+        v |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(v);
+        }
+        shift += 7;
+        if shift >= 32 {
+            return Err(corrupt("varint too long"));
+        }
+    }
+}
+
+/// Encode the K_TOKENS section from a built [`TokenIndex`]:
+/// `[u32 ntokens]` then per token `[u32 len][utf8][u32 nrows][deltas…]`
+/// where deltas are LEB128: first row id as-is, then successive gaps.
+fn encode_tokens(idx: &TokenIndex) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(idx.tokens.len() as u32).to_le_bytes());
+    for (t, rows) in idx.tokens.iter().zip(&idx.postings) {
+        body.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        body.extend_from_slice(t.as_bytes());
+        body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        let mut prev = 0u32;
+        for (i, &row) in rows.iter().enumerate() {
+            let delta = if i == 0 { row } else { row - prev };
+            varint_push(&mut body, delta);
+            prev = row;
+        }
+    }
+    body
+}
+
+/// Decode a K_TOKENS body. Validates tokens sorted-ascending and row ids
+/// strictly ascending within `count`.
+fn decode_tokens(body: &[u8], count: usize) -> Result<TokenIndex> {
+    let mut c = Cur::new(body);
+    let n = c.u32()? as usize;
+    let mut tokens: Vec<String> = Vec::with_capacity(n.min(1 << 20));
+    let mut postings: Vec<Vec<u32>> = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let tlen = c.u32()? as usize;
+        let tok =
+            String::from_utf8(c.take(tlen)?.to_vec()).map_err(|_| corrupt("token not utf8"))?;
+        if let Some(last) = tokens.last() {
+            if *last >= tok {
+                return Err(corrupt("token dictionary not sorted"));
+            }
+        }
+        let nrows = c.u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows.min(count + 1));
+        let mut prev = 0u32;
+        for i in 0..nrows {
+            let delta = varint_read(&mut c)?;
+            let row = if i == 0 {
+                delta
+            } else {
+                prev.checked_add(delta)
+                    .ok_or_else(|| corrupt("posting overflow"))?
+            };
+            if i > 0 && delta == 0 {
+                return Err(corrupt("postings not strictly ascending"));
+            }
+            if row as usize >= count {
+                return Err(corrupt("posting row out of range"));
+            }
+            rows.push(row);
+            prev = row;
+        }
+        tokens.push(tok);
+        postings.push(rows);
+    }
+    Ok(TokenIndex { tokens, postings })
+}
+
 fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
     let count = records.len();
     let plans = plan_labels(records);
@@ -1070,6 +1288,13 @@ fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
 
     if records.iter().any(|r| r.borrow().text.is_some()) {
         push_section(&mut out, &mut dir, K_TEXT, "", &encode_texts(records));
+        push_section(
+            &mut out,
+            &mut dir,
+            K_TOKENS,
+            "",
+            &encode_tokens(&TokenIndex::build(records)),
+        );
     }
 
     let blocks = build_blocks(records, &plans);
@@ -1157,6 +1382,9 @@ impl<'a> Cur<'a> {
         let s = &self.b[self.p..end];
         self.p = end;
         Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
@@ -1317,6 +1545,7 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
     let mut blocks: Option<Vec<BlockMeta>> = None;
     let mut payloads: Option<Arc<PayloadIndex>> = None;
     let mut texts: Option<Arc<TextIndex>> = None;
+    let mut tokens: Option<Arc<TokenIndex>> = None;
 
     for e in &dir.entries {
         let start = e.offset as usize;
@@ -1362,6 +1591,9 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
                     (start + 4) as u64,
                 )?));
             }
+            K_TOKENS => {
+                tokens = Some(Arc::new(decode_tokens(body, count)?));
+            }
             _ => {} // unknown kind: ignore (forward-compat)
         }
     }
@@ -1382,6 +1614,7 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
         blocks: Arc::new(blocks),
         payloads: Payloads::File(payloads),
         texts: texts.map(Texts::File),
+        tokens,
     })
 }
 
@@ -1736,6 +1969,21 @@ pub fn load_text_index(
     // length (it validates zero-based/monotonic/terminating).
     let idx = decode_text_header(&header, count, e.offset + 4, blob_len)?;
     Ok(Some(idx))
+}
+
+/// Load the decoded token postings index, or `None` when the segment has no
+/// K_TOKENS section. Loaded only for text queries (the engine passes
+/// `need_tokens` through), so field-only scans never pay for it.
+pub fn load_tokens(
+    file: &File,
+    dir: &SegDir,
+    bytes_read: &AtomicU64,
+) -> Result<Option<TokenIndex>> {
+    let Some(e) = dir.entries.get(&(K_TOKENS, String::new())) else {
+        return Ok(None);
+    };
+    let body = read_verified_body(file, e, K_TOKENS, bytes_read)?;
+    Ok(Some(decode_tokens(&body, dir.count)?))
 }
 
 /// Load *only* the payload offset table (the first `8·(count+1)` bytes of the

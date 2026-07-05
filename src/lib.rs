@@ -38,6 +38,7 @@ mod cache;
 mod engine;
 mod error;
 mod manifest;
+mod memtable;
 mod record;
 mod segment;
 pub mod text;

@@ -102,10 +102,35 @@ pub struct QuerySpec {
     /// `Some(_)` with `limit > 0` engages a bounded top-k heap that never
     /// materializes the full match set (see `Girder::scan`).
     pub order_by: Option<OrderBy>,
+    /// Full-text predicate over `Record.text`: every token of this query
+    /// (per [`crate::text::fts_tokens`]) must appear among the record's text
+    /// tokens — AND semantics, case-insensitive, exact token equality. A
+    /// query with no tokens matches nothing; a record without text never
+    /// matches. Served from the segment token index; [`QuerySpec::matches`]
+    /// is the naive-scan oracle the index must agree with.
+    pub text_match: Option<String>,
 }
 
 impl QuerySpec {
+    /// The full predicate — the naive-scan ORACLE (fields + text). Backends
+    /// of the text predicate (segment token index, memtable token map) must
+    /// agree with this exactly.
     pub fn matches(&self, record: &Record) -> bool {
+        if !self.matches_fields(record) {
+            return false;
+        }
+        match &self.text_match {
+            None => true,
+            Some(q) => {
+                let want = crate::text::fts_tokens(q);
+                crate::text::text_contains_all(record.text.as_deref(), &want)
+            }
+        }
+    }
+
+    /// Every predicate EXCEPT text (used by callers that pre-resolve the
+    /// text predicate through a token structure).
+    pub fn matches_fields(&self, record: &Record) -> bool {
         if let Some((lo, hi)) = self.time {
             if record.timestamp < lo || record.timestamp > hi {
                 return false;

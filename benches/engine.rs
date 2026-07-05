@@ -388,6 +388,81 @@ fn main() {
             mb(rss_bytes()),
         );
     });
+
+    // ---- D8: the KB-document compression leg -------------------------------
+    // The main corpus's ~45-char texts sit below TEXT_COMPRESS_MIN and stay
+    // raw (ratio ≈ 1.0, stated honestly above). This leg builds a 50k corpus
+    // of ~4 KiB document-shaped texts — the rivet span-text shape D8 targets
+    // — twice (with text / without), so the stored-text footprint and its
+    // compression ratio are MEASURED, and text reads are timed on the
+    // corpus where inflation actually runs.
+    runtime.block_on(async {
+        let n_docs = 50_000usize;
+        let doc = |i: usize| {
+            // Document-shaped: repetitive structure + varying identifiers,
+            // like a span's name + attribute values.
+            format!(
+                "chat.completions gen_ai.system=openai gen_ai.request.model=gpt-4o \
+                 session={i} user=user-{} release=2026.7.{} {}",
+                i % 997,
+                i % 30,
+                "the quick brown fox jumps over the lazy dog and bills tokens \
+                 while the gateway retries idempotently "
+                    .repeat(36)
+            )
+        };
+        let build = |with_text: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = GirderConfig::at(dir.path());
+            cfg.fsync = FsyncPolicy::EveryN(256);
+            cfg.memtable_max_records = 10_000;
+            cfg.compact_min_segments = 8;
+            cfg.tick_interval = Duration::from_secs(3600);
+            async move {
+                let engine = Girder::open(cfg).await.unwrap();
+                for batch in (0..n_docs).collect::<Vec<_>>().chunks(500) {
+                    let records: Vec<Record> = batch
+                        .iter()
+                        .map(|&i| {
+                            let mut r = record(i);
+                            r.text = with_text.then(|| doc(i));
+                            r
+                        })
+                        .collect();
+                    engine.put_batch(records).await.unwrap();
+                }
+                engine.flush().await.unwrap();
+                (engine, dir)
+            }
+        };
+        let (plain_engine, plain_dir) = build(false).await;
+        let plain = total_segment_bytes(plain_dir.path());
+        drop(plain_engine);
+        let (engine, dir) = build(true).await;
+        let with_text = total_segment_bytes(dir.path());
+        let raw_text: u64 = (0..n_docs).map(|i| doc(i).len() as u64).sum();
+        let stored = with_text.saturating_sub(plain);
+        println!(
+            "doc corpus (50k × ~{:.1} KiB text): raw text {:.1} MB → stored text+index {:.1} MB (ratio {:.2}×)",
+            raw_text as f64 / n_docs as f64 / 1024.0,
+            mb(raw_text),
+            mb(stored),
+            raw_text as f64 / stored.max(1) as f64,
+        );
+        // Scattered materialize (point-shaped text reads, inflate per row).
+        let keys: Vec<String> = (0..1000).map(|i| format!("s/{:08}", i * 37 % n_docs)).collect();
+        let start = Instant::now();
+        let mut found = 0usize;
+        for k in &keys {
+            if engine.get(k).await.unwrap().is_some() {
+                found += 1;
+            }
+        }
+        println!(
+            "doc corpus point gets (scattered, text inflated per row): {:.2?} / 1000 ({found} hits)",
+            start.elapsed()
+        );
+    });
 }
 
 /// Block-on a scan from inside an already-async closure boundary. The bench

@@ -108,6 +108,29 @@ ACCELERATE (the interior space makes `case` a left-complete prefix
 fragment) — the analyzer is sharper than intuition; the leg now uses a
 truly constraint-free pattern.
 
+### D8 re-run (2026-07-06, K_TEXT v2 per-row-compress-if-large)
+
+| leg | D8 | vs baseline |
+|---|---|---|
+| on-disk (1M, ~45-char texts) | **1239.0 MB** | ratio ≈ 1.00 — HONESTLY none: texts below the 512 B threshold stay raw by design |
+| point gets | 4.90 ms / 1000 | parity (5.5–5.7 µs/get) |
+| selective warm | 3.14 ms | parity (2.8 ms) |
+| fts selective / broad / composed | 1.12 ms / 384 ms / 469 µs | broad exact parity; selective+composed inside the same-run ambient drift seen since D7 |
+| **doc corpus** (50k × ~3.6 KiB document-shaped text) | raw text 177.0 MB → stored **11.9 MB** (**14.8×**) | new leg |
+| doc corpus scattered point gets (inflate per row) | **7.40 ms / 1000** | ~7.4 µs/get incl. inflate |
+
+The doc leg is where D8 lives: rivet's span-text documents (name + every
+string attribute) are KB-scale and structure-heavy. Honesty note on the
+ratio: the synthetic document repeats structure heavily, which flatters
+deflate — treat 14.8× as the shape's ceiling, not a general claim;
+moderately repetitive real corpora should expect low single digits.
+Design-history note (why per-row, recorded so nobody reintroduces
+chunks): the first D8 cut deflated 64 KiB chunks and the bench caught
+scattered reads regressing 12× (fts selective warm 10.8 ms, point gets
+20.5 ms/1000, RSS +900 MB — every materialized row inflated a whole
+chunk). Per-row storage makes the small-text corpus byte-identical to v1
+and prices each inflate by the row's own size.
+
 ## The rivet-seam baselines (search-bench, 2026-07-05)
 
 Cross-store numbers measured through rivet's `SearchIndex` seam

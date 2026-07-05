@@ -28,6 +28,25 @@ matches** — ignore-is-not-fail-closed. An unknown FUTURE body version is a
 loud corrupt error instead. Written: v2 (token directory + lazy postings
 blob). Read: v1 + v2.
 
+**K_TEXT versions by POISON, not sentinel (D8).** Unlike K_TOKENS, a v1
+K_TEXT body begins with the presence BITMAP — arbitrary bytes — so an
+in-body sentinel cannot be unambiguous. Instead, a v2 segment writes a
+2-byte poison body at the old directory key `(K_TEXT, "")` — the v1
+decoder requires at least `ceil(count/8) + 8·(count+1)` bytes, so for any
+count ≥ 1 the poison fails GUARANTEED-loud with "text section shorter
+than header" — and the real v2 body under the new name `(K_TEXT, "z2")`:
+an in-body version word, presence bitmap, COMPRESSED-rows bitmap,
+stored-space offsets, then the blob with each row's text raw below 512
+raw bytes and individually deflated above (stored compressed only when
+actually smaller). New readers resolve "z2" first and never parse the
+poison; an old binary reading a v2 store dies loudly instead of silently
+reading every text as absent — the same ignore-is-not-fail-closed
+doctrine, achieved through the self-describing directory because the body
+cannot carry a sentinel. Per-ROW compression is deliberate: the first D8
+cut compressed 64 KiB chunks and regressed scattered reads 12× (every
+materialized row inflated a whole chunk). v1 stores stay readable
+forever; compaction rewrites them to v2. Written: v2. Read: v1 + v2.
+
 ## Deletes / tombstone vocabulary (no format change)
 
 The delete API and the G5 shadowing guarantee (`docs/GUARANTEES.md`

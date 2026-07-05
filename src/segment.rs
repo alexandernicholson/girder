@@ -311,18 +311,52 @@ impl PayloadIndex {
 }
 
 /// The text offset table (K_TEXT): which rows have text, and where each
-/// row's utf8 slice lives in the file. Blob bytes are `read_exact_at` per
-/// surviving row, mirroring [`PayloadIndex`] — a scan that never
-/// materializes a row never reads its text.
+/// row's utf8 slice lives in the file. Blob bytes are read per surviving
+/// row, mirroring [`PayloadIndex`] — a scan that never materializes a row
+/// never reads its text. `rel` offsets are in STORED space; a v2 section
+/// (D8) additionally marks which rows are individually deflated.
 pub struct TextIndex {
     abs_base: u64,
     present: Vec<bool>,
     rel: Vec<u64>,
+    /// v2 (D8): which rows' stored bytes are deflate-compressed (rows above
+    /// [`TEXT_COMPRESS_MIN`] raw bytes at encode). `None` = legacy v1 blob.
+    /// Per-ROW compression keeps every point/scattered read one bounded
+    /// read (+ one inflate amortized by the row's own size) — the first
+    /// D8 cut compressed 64 KiB CHUNKS and regressed scattered reads 12×
+    /// (every materialized row inflated a whole chunk); do not reintroduce
+    /// chunks without beating that number.
+    compressed: Option<Vec<bool>>,
 }
+
+/// Raw bytes above which a row's text is stored deflated (D8, ruling
+/// D8-1′). Below it, deflate's overhead eats the win on small documents
+/// and the row stays raw — a small-text corpus reads byte-identically to
+/// v1 by construction. Rivet's span-text documents (name + every string
+/// attribute) are the KB-scale payoff this targets.
+const TEXT_COMPRESS_MIN: usize = 512;
 
 impl TextIndex {
     fn bytes(&self) -> u64 {
-        self.present.len() as u64 + (self.rel.len() as u64) * 8 + 32
+        let comp = self.compressed.as_ref().map_or(0, |c| c.len() as u64 + 24);
+        self.present.len() as u64 + (self.rel.len() as u64) * 8 + 32 + comp
+    }
+
+    /// Decode one row's stored text bytes (inflating if the row is marked
+    /// compressed) — shared by the per-row file read path and the
+    /// whole-file record reader.
+    fn decode_row_text(&self, i: usize, stored: Vec<u8>) -> Result<String> {
+        let bytes = if self.compressed.as_ref().is_some_and(|c| c[i]) {
+            use std::io::Read as _;
+            let mut raw = Vec::new();
+            flate2::bufread::DeflateDecoder::new(stored.as_slice())
+                .read_to_end(&mut raw)
+                .map_err(|_| corrupt("text row inflate failed"))?;
+            raw
+        } else {
+            stored
+        };
+        String::from_utf8(bytes).map_err(|_| corrupt("text not utf8"))
     }
 }
 
@@ -958,17 +992,19 @@ impl SegmentColumns {
             None => Ok(None),
             Some(Texts::Mem(v)) => Ok(v[i].clone()),
             Some(Texts::File(ti)) => {
-                if ti.present[i] {
-                    let f = file.ok_or_else(|| corrupt("text file handle missing"))?;
-                    let off = ti.abs_base + ti.rel[i];
-                    let len = (ti.rel[i + 1] - ti.rel[i]) as usize;
-                    let bytes = read_at(f, off, len, bytes_read)?;
-                    Ok(Some(
-                        String::from_utf8(bytes).map_err(|_| corrupt("text not utf8"))?,
-                    ))
-                } else {
-                    Ok(None)
+                if !ti.present[i] {
+                    return Ok(None);
                 }
+                let raw_start = ti.rel[i];
+                let raw_len = (ti.rel[i + 1] - raw_start) as usize;
+                if raw_len == 0 {
+                    return Ok(Some(String::new())); // present-but-empty text
+                }
+                let f = file.ok_or_else(|| corrupt("text file handle missing"))?;
+                // One bounded read either way; v2 rows marked compressed
+                // additionally inflate their own bytes (D8, per-row).
+                let stored = read_at(f, ti.abs_base + raw_start, raw_len, bytes_read)?;
+                Ok(Some(ti.decode_row_text(i, stored)?))
             }
         }
     }
@@ -1448,36 +1484,65 @@ fn encode_payloads<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
     body
 }
 
-/// Encode the K_TEXT section: presence bitmap + zero-based offset table
-/// (count+1 entries over ALL rows; absent rows contribute zero length) +
-/// concatenated utf8 blob of present texts.
+/// The K_TEXT poison body (D8): written at the OLD directory key
+/// `(K_TEXT, "")` so a pre-D8 binary reading a v2 store fails LOUDLY —
+/// the v1 decoder requires at least `ceil(count/8) + 8·(count+1)` bytes
+/// (≥ 17 for any non-empty segment), so 2 bytes are a guaranteed "text
+/// section shorter than header" corrupt error — instead of silently
+/// reading every text as absent. The real v2 body lives under
+/// [`TEXT_V2_NAME`]; rationale in `docs/COMPAT.md`.
+const TEXT_POISON: &[u8] = b"!2";
+/// Directory name of the v2 (per-row-compressed) K_TEXT body.
+const TEXT_V2_NAME: &str = "z2";
+/// In-body version word of the "z2" body (future-proofing: the NAME gates
+/// v1-vs-v2, the word gates v2-vs-later; unknown future = loud Corrupt).
+const TEXT_V2_VERSION: u32 = 2;
+
+/// Encode the K_TEXT v2 section (D8, ruling D8-1′): `[u32 version=2]`, the
+/// presence bitmap, the COMPRESSED-rows bitmap, the zero-based STORED-space
+/// offset table (count+1 over ALL rows), then the stored blob — each row's
+/// text raw when < [`TEXT_COMPRESS_MIN`] bytes, individually deflated
+/// otherwise. Per-row storage keeps every point read one bounded
+/// `read_exact_at` (+ an inflate amortized by the row's own size).
 fn encode_texts<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
+    use std::io::Write as _;
     let count = records.len();
-    let mut presence = vec![0u8; count.div_ceil(8)];
-    let total: usize = records
-        .iter()
-        .map(|r| r.borrow().text.as_deref().map_or(0, str::len))
-        .sum();
-    let mut body = Vec::with_capacity(presence.len() + 8 * (count + 1) + total);
-    let mut off = 0u64;
+    let bitmap_len = count.div_ceil(8);
+    let mut presence = vec![0u8; bitmap_len];
+    let mut compressed = vec![0u8; bitmap_len];
+    let mut blob = Vec::new();
     let mut offsets = Vec::with_capacity(count + 1);
     offsets.push(0u64);
     for (i, r) in records.iter().enumerate() {
         if let Some(t) = &r.borrow().text {
             presence[i / 8] |= 1 << (i % 8);
-            off += t.len() as u64;
+            if t.len() >= TEXT_COMPRESS_MIN {
+                let mut enc =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(t.as_bytes()).expect("in-memory write");
+                let comp = enc.finish().expect("in-memory finish");
+                // Store compressed only when it actually shrinks — an
+                // incompressible row stays raw (honesty at the byte level).
+                if comp.len() < t.len() {
+                    compressed[i / 8] |= 1 << (i % 8);
+                    blob.extend_from_slice(&comp);
+                } else {
+                    blob.extend_from_slice(t.as_bytes());
+                }
+            } else {
+                blob.extend_from_slice(t.as_bytes());
+            }
         }
-        offsets.push(off);
+        offsets.push(blob.len() as u64);
     }
+    let mut body = Vec::with_capacity(4 + bitmap_len * 2 + 8 * (count + 1) + blob.len());
+    body.extend_from_slice(&TEXT_V2_VERSION.to_le_bytes());
     body.extend_from_slice(&presence);
+    body.extend_from_slice(&compressed);
     for o in &offsets {
         body.extend_from_slice(&o.to_le_bytes());
     }
-    for r in records {
-        if let Some(t) = &r.borrow().text {
-            body.extend_from_slice(t.as_bytes());
-        }
-    }
+    body.extend_from_slice(&blob);
     body
 }
 
@@ -1721,7 +1786,16 @@ fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
     push_section(&mut out, &mut dir, K_PAYLOAD, "", &encode_payloads(records));
 
     if records.iter().any(|r| r.borrow().text.is_some()) {
-        push_section(&mut out, &mut dir, K_TEXT, "", &encode_texts(records));
+        // D8: the poison at the old key makes a pre-D8 binary fail LOUDLY;
+        // the real v2 body rides the "z2" name (docs/COMPAT.md).
+        push_section(&mut out, &mut dir, K_TEXT, "", TEXT_POISON);
+        push_section(
+            &mut out,
+            &mut dir,
+            K_TEXT,
+            TEXT_V2_NAME,
+            &encode_texts(records),
+        );
         push_section(
             &mut out,
             &mut dir,
@@ -1982,6 +2056,7 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
     let mut blocks: Option<Vec<BlockMeta>> = None;
     let mut payloads: Option<Arc<PayloadIndex>> = None;
     let mut texts: Option<Arc<TextIndex>> = None;
+    let mut text_v1_pending: Option<(&[u8], usize)> = None;
     let mut tokens: Option<Arc<TokenIndex>> = None;
 
     for e in &dir.entries {
@@ -2022,11 +2097,16 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
                     Some(rmp_serde::from_slice(body).map_err(|e| corrupt(format!("blocks: {e}")))?);
             }
             K_TEXT => {
-                texts = Some(Arc::new(decode_text_index(
-                    body,
-                    count,
-                    (start + 4) as u64,
-                )?));
+                // D8: "z2" = the v2 chunked body; "" is EITHER a legacy v1
+                // body (old file) or the 2-byte poison beside a "z2" entry
+                // (new file, aimed at pre-D8 binaries). Defer the "" decode
+                // until the whole directory is walked so the poison is
+                // never parsed when v2 is present.
+                if e.name == TEXT_V2_NAME {
+                    texts = Some(Arc::new(decode_text_v2(body, count, (start + 4) as u64)?));
+                } else {
+                    text_v1_pending = Some((body, start));
+                }
             }
             K_TOKENS => {
                 tokens = Some(Arc::new(decode_tokens(body, count)?));
@@ -2035,6 +2115,16 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
         }
     }
 
+    if texts.is_none() {
+        if let Some((body, start)) = text_v1_pending {
+            // No v2 entry: the "" body is a real legacy v1 section.
+            texts = Some(Arc::new(decode_text_index(
+                body,
+                count,
+                (start + 4) as u64,
+            )?));
+        }
+    }
     let keys = keys.ok_or_else(|| corrupt("missing key section"))?;
     let timestamps = timestamps.ok_or_else(|| corrupt("missing timestamp section"))?;
     let payloads = payloads.ok_or_else(|| corrupt("missing payload section"))?;
@@ -2105,7 +2195,77 @@ fn decode_text_header(
         abs_base,
         present,
         rel,
+        compressed: None,
     })
+}
+
+/// Decode a v2 K_TEXT header (D8): `[u32 version]` (already consumed by
+/// callers), presence bitmap, compressed-rows bitmap, STORED-space offset
+/// table. Validated like v1 (zero-based, monotonic, terminating exactly at
+/// the stored blob length) plus: a compressed bit on an absent row is
+/// corruption.
+fn decode_text_v2_header(
+    header: &[u8],
+    count: usize,
+    blob_abs: u64,
+    blob_len: u64,
+) -> Result<TextIndex> {
+    let bitmap_len = count.div_ceil(8);
+    let table_len = 8 * (count + 1);
+    if header.len() != bitmap_len * 2 + table_len {
+        return Err(corrupt("text v2 header length mismatch"));
+    }
+    let mut present = Vec::with_capacity(count);
+    let mut compressed = Vec::with_capacity(count);
+    for i in 0..count {
+        present.push(header[i / 8] & (1 << (i % 8)) != 0);
+        compressed.push(header[bitmap_len + i / 8] & (1 << (i % 8)) != 0);
+    }
+    if compressed.iter().zip(&present).any(|(&c, &p)| c && !p) {
+        return Err(corrupt("compressed bit on absent text row"));
+    }
+    let mut c = Cur::new(&header[bitmap_len * 2..]);
+    let mut rel = Vec::with_capacity(count + 1);
+    for _ in 0..count + 1 {
+        rel.push(c.u64()?);
+    }
+    if rel[0] != 0 {
+        return Err(corrupt("text offsets not zero-based"));
+    }
+    if rel.windows(2).any(|w| w[0] > w[1]) {
+        return Err(corrupt("text offsets not monotonic"));
+    }
+    if *rel.last().unwrap() != blob_len {
+        return Err(corrupt(
+            "text offset table inconsistent with section length",
+        ));
+    }
+    Ok(TextIndex {
+        abs_base: blob_abs,
+        present,
+        rel,
+        compressed: Some(compressed),
+    })
+}
+
+/// Decode a whole v2 K_TEXT body (the whole-file read path).
+fn decode_text_v2(body: &[u8], count: usize, body_abs: u64) -> Result<TextIndex> {
+    let mut c = Cur::new(body);
+    let version = c.u32()?;
+    if version != TEXT_V2_VERSION {
+        // Unknown FUTURE layout: fail CLOSED — reading it as no-text would
+        // serve silently-absent documents.
+        return Err(corrupt("unsupported K_TEXT z2 version"));
+    }
+    let bitmap_len = count.div_ceil(8);
+    let table_len = 8 * (count + 1);
+    let header_len = bitmap_len
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(table_len))
+        .ok_or_else(|| corrupt("text v2 header overflow"))?;
+    let header = c.take(header_len)?;
+    let blob_len = c.rest().len() as u64;
+    decode_text_v2_header(header, count, body_abs + 4 + header_len as u64, blob_len)
 }
 
 fn decode_v1_records(bytes: &[u8]) -> Result<Vec<Record>> {
@@ -2167,10 +2327,8 @@ pub fn read_all_records(path: &Path) -> Result<Vec<Record>> {
                     Some(Texts::File(ti)) if ti.present[i] => {
                         let tfrom = (ti.abs_base + ti.rel[i]) as usize;
                         let tlen = (ti.rel[i + 1] - ti.rel[i]) as usize;
-                        Some(
-                            String::from_utf8(slice(&bytes, tfrom, tlen)?.to_vec())
-                                .map_err(|_| corrupt("text not utf8"))?,
-                        )
+                        let stored = slice(&bytes, tfrom, tlen)?.to_vec();
+                        Some(ti.decode_row_text(i, stored)?)
                     }
                     _ => None,
                 };
@@ -2396,10 +2554,37 @@ pub fn load_text_index(
     dir: &SegDir,
     bytes_read: &AtomicU64,
 ) -> Result<Option<TextIndex>> {
+    let count = dir.count;
+    // D8: the v2 chunked body rides the "z2" name; the old "" key holds
+    // the poison a pre-D8 binary trips over. New readers resolve v2 FIRST
+    // and never touch the poison.
+    if let Some(e) = dir.entries.get(&(K_TEXT, TEXT_V2_NAME.to_string())) {
+        let version_word = read_at(file, e.offset + 4, 4, bytes_read)?;
+        let version = u32::from_le_bytes(version_word.as_slice().try_into().unwrap());
+        if version != TEXT_V2_VERSION {
+            return Err(corrupt("unsupported K_TEXT z2 version"));
+        }
+        let bitmap_len = count.div_ceil(8);
+        let table_len = 8usize
+            .checked_mul(count + 1)
+            .ok_or_else(|| corrupt("text table overflow"))?;
+        let header_len = bitmap_len
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(table_len))
+            .ok_or_else(|| corrupt("text v2 header overflow"))?;
+        if (e.len as usize) < 4 + header_len {
+            return Err(corrupt("text v2 section shorter than header"));
+        }
+        let header = read_at(file, e.offset + 8, header_len, bytes_read)?;
+        let blob_abs = e.offset + 8 + header_len as u64;
+        let blob_len = e.len - 4 - header_len as u64;
+        return Ok(Some(decode_text_v2_header(
+            &header, count, blob_abs, blob_len,
+        )?));
+    }
     let Some(e) = dir.entries.get(&(K_TEXT, String::new())) else {
         return Ok(None);
     };
-    let count = dir.count;
     let presence_len = count.div_ceil(8);
     let table_len = 8usize
         .checked_mul(count + 1)
@@ -3024,5 +3209,130 @@ mod tests {
         assert_eq!(r0.text, None);
         let r3 = cols.materialize(3, Some(&file), &br).unwrap();
         assert_eq!(r3.text.as_deref(), Some(""));
+    }
+
+    /// D8 (ruling D8-1′): a mixed corpus — absent, empty, small-raw and
+    /// KB-scale texts — round-trips byte-identically through both text read
+    /// paths, in ascending AND scattered order. Small rows must be stored
+    /// RAW (the compressed bitmap is the proof), big compressible rows
+    /// deflated, and an incompressible big row honestly kept raw.
+    #[test]
+    fn text_v2_per_row_compression_roundtrip() {
+        // Pseudo-random incompressible bytes (printable, so utf8-safe).
+        let mut state = 0x9e37_79b9u64;
+        let mut noise = String::new();
+        for _ in 0..2000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            noise.push(char::from(b' ' + (state % 90) as u8));
+        }
+        let mut records: Vec<Record> = (0..300)
+            .map(|i| {
+                let text = match i % 5 {
+                    0 => None,
+                    1 => Some(String::new()),
+                    2 => Some(format!("small doc {i}")), // < threshold: raw
+                    3 => Some(format!("big {i} {}", "lorem ipsum dolor ".repeat(300))),
+                    _ => Some(noise.clone()), // big, high-entropy (mildly compressible)
+                };
+                Record {
+                    key: format!("k/{i:04}"),
+                    timestamp: i as i64,
+                    labels: BTreeMap::new(),
+                    numerics: BTreeMap::new(),
+                    payload: vec![1u8; 8],
+                    text,
+                }
+            })
+            .collect();
+        let want: Vec<Option<String>> = records.iter().map(|r| r.text.clone()).collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("perrow.gird");
+        write_segment(&path, &mut records).unwrap();
+
+        let cols = read_columns(&path).unwrap();
+        let Some(Texts::File(ti)) = &cols.texts else {
+            panic!("expected file-backed text");
+        };
+        let comp = ti.compressed.as_ref().expect("v2 bitmap");
+        assert!(comp.iter().any(|&c| c), "big compressible rows deflated");
+        #[allow(clippy::needless_range_loop)] // i%5 drives the corpus shape
+        for i in 0..records.len() {
+            match i % 5 {
+                2 => assert!(!comp[i], "small row {i} must stay raw"),
+                3 => assert!(comp[i], "compressible row {i} must be deflated"),
+                // Row 4 (high-entropy printable text) deflates only mildly —
+                // whichever way the stored-only-if-smaller valve lands, the
+                // roundtrip below is the contract. (Truly incompressible
+                // UTF-8 barely exists; the valve is for pathological rows.)
+                4 => {}
+                _ => assert!(!comp[i]),
+            }
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let br = std::sync::atomic::AtomicU64::new(0);
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(cols.text_at(i, Some(&file), &br).unwrap(), *w, "row {i}");
+        }
+        for i in (0..records.len()).rev().step_by(7) {
+            assert_eq!(
+                cols.text_at(i, Some(&file), &br).unwrap(),
+                want[i],
+                "row {i}"
+            );
+        }
+        // Whole-file reader (compaction path).
+        let back = read_all_records(&path).unwrap();
+        for (i, r) in back.iter().enumerate() {
+            assert_eq!(r.text, want[i], "row {i}");
+        }
+    }
+
+    /// D8 fail-closed at the z2 tier: an unknown FUTURE z2 body version is
+    /// a loud corrupt error, never a silent no-text read.
+    #[test]
+    fn text_z2_unknown_future_version_fails_closed() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(TEXT_V2_VERSION + 1).to_le_bytes());
+        body.extend_from_slice(&[0u8; 32]);
+        assert!(decode_text_v2(&body, 4, 0).is_err());
+    }
+
+    /// D8 fail-closed: the poison body at the OLD key is a GUARANTEED loud
+    /// error through the v1 decoder (what a pre-D8 binary would run) for
+    /// any non-empty segment — never a silent no-text read. And the legacy
+    /// v1 body itself stays readable forever.
+    #[test]
+    fn text_poison_fails_v1_loud_and_v1_reads_forever() {
+        // A pre-D8 binary decodes (K_TEXT, "") with decode_text_index:
+        assert!(
+            decode_text_index(TEXT_POISON, 1, 0).is_err(),
+            "poison must fail the v1 decoder for count ≥ 1"
+        );
+        assert!(decode_text_index(TEXT_POISON, 4096, 0).is_err());
+
+        // Hand-encode the exact pre-D8 v1 layout and read it back.
+        let texts = [Some("alpha"), None, Some(""), Some("beta gamma")];
+        let count = texts.len();
+        let mut presence = vec![0u8; count.div_ceil(8)];
+        let mut offsets = vec![0u64];
+        let mut blob = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            if let Some(t) = t {
+                presence[i / 8] |= 1 << (i % 8);
+                blob.extend_from_slice(t.as_bytes());
+            }
+            offsets.push(blob.len() as u64);
+        }
+        let mut v1 = presence.clone();
+        for o in &offsets {
+            v1.extend_from_slice(&o.to_le_bytes());
+        }
+        v1.extend_from_slice(&blob);
+        let ti = decode_text_index(&v1, count, 0).unwrap();
+        assert!(ti.compressed.is_none(), "v1 = plain blob");
+        assert_eq!(ti.present, vec![true, false, true, true]);
+        assert_eq!(*ti.rel.last().unwrap(), blob.len() as u64);
     }
 }

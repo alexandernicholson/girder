@@ -18,6 +18,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 crc32fast = "1"
+# K_TEXT chunk compression (D8, ruling D-5a): deflate is an algorithm we
+# buy, not a format we own — girder's first compression dep, rust backend
+# (miniz_oxide), no C toolchain.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"

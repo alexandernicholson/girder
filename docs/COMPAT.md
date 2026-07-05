@@ -18,6 +18,16 @@ directory is self-describing `(kind, name, offset, len, crc)` entries and
 readers ignore unknown kinds — adding a section (K_TEXT/K_TOKENS were added
 this way) requires no version bump.
 
+**Section-BODY layouts version separately when ignoring would lie.** The
+K_TOKENS body carries its own version word (D7-b: `[u32 u32::MAX
+sentinel][u32 version]`; a headerless body is v1, readable forever — a v1
+body starts with `ntokens`, which can never be `u32::MAX`). Deliberately
+NOT a new section kind: an old reader ignoring an unknown kind would treat
+the segment as having no text index and serve **silently-empty text
+matches** — ignore-is-not-fail-closed. An unknown FUTURE body version is a
+loud corrupt error instead. Written: v2 (token directory + lazy postings
+blob). Read: v1 + v2.
+
 ## Deletes / tombstone vocabulary (no format change)
 
 The delete API and the G5 shadowing guarantee (`docs/GUARANTEES.md`

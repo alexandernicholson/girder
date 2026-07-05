@@ -333,15 +333,51 @@ impl TextIndex {
 /// the tokenizer at encode time IS the query tokenizer (`text::fts_tokens`).
 pub struct TokenIndex {
     tokens: Vec<String>,
-    postings: Vec<Vec<u32>>,
+    postings: Postings,
+}
+
+/// How a token's postings are held (D7-b). The build path and legacy v1
+/// bodies are fully decoded; a v2 body keeps the varint blob and decodes a
+/// token's list the FIRST time a query asks for it — `OnceLock` per token,
+/// so warm queries borrow the decoded list exactly like the eager form
+/// (decode once per token per cache residency, not once per query; the
+/// first bench cut decoded per-query and REGRESSED the warm FTS legs).
+/// The whole blob was validated at section decode, so lazy decoding cannot
+/// fail.
+enum Postings {
+    Eager(Vec<Vec<u32>>),
+    Lazy {
+        /// The concatenated per-token varint-delta lists, validated at
+        /// decode time (ascending, in-range, spans exact).
+        blob: Vec<u8>,
+        /// Per token, parallel to `tokens`: (byte offset, byte len, nrows).
+        spans: Vec<(u32, u32, u32)>,
+        /// Decode-once cells, parallel to `tokens` (empty until queried).
+        /// `bytes()` accounts the blob + directory only: the decoded lists
+        /// are query working set, bounded above by ~4× the blob.
+        decoded: Vec<std::sync::OnceLock<Vec<u32>>>,
+    },
 }
 
 impl TokenIndex {
     fn postings_of(&self, token: &str) -> Option<&[u32]> {
-        self.tokens
+        let i = self
+            .tokens
             .binary_search_by(|t| t.as_str().cmp(token))
-            .ok()
-            .map(|i| self.postings[i].as_slice())
+            .ok()?;
+        Some(match &self.postings {
+            Postings::Eager(lists) => lists[i].as_slice(),
+            Postings::Lazy {
+                blob,
+                spans,
+                decoded,
+            } => decoded[i]
+                .get_or_init(|| {
+                    let (off, len, nrows) = spans[i];
+                    decode_posting_list(&blob[off as usize..(off + len) as usize], nrows as usize)
+                })
+                .as_slice(),
+        })
     }
 
     /// Rows whose text contains ALL of `want` (AND-of-tokens), ascending.
@@ -368,8 +404,18 @@ impl TokenIndex {
 
     fn bytes(&self) -> u64 {
         let mut n = 64u64;
-        for (t, p) in self.tokens.iter().zip(&self.postings) {
-            n += t.len() as u64 + 24 + (p.len() as u64) * 4 + 24;
+        for t in &self.tokens {
+            n += t.len() as u64 + 24;
+        }
+        match &self.postings {
+            Postings::Eager(lists) => {
+                for p in lists {
+                    n += (p.len() as u64) * 4 + 24;
+                }
+            }
+            Postings::Lazy { blob, spans, .. } => {
+                n += blob.len() as u64 + (spans.len() as u64) * 12 + 48;
+            }
         }
         n
     }
@@ -393,8 +439,28 @@ impl TokenIndex {
             tokens.push(t);
             postings.push(p); // ascending by construction (row order)
         }
-        TokenIndex { tokens, postings }
+        TokenIndex {
+            tokens,
+            postings: Postings::Eager(postings),
+        }
     }
+}
+
+/// Decode one validated varint-delta posting list (the lazy read path). The
+/// blob was fully validated at section decode, so this cannot fail — the
+/// asserts are debug belts, not error paths.
+fn decode_posting_list(span: &[u8], nrows: usize) -> Vec<u32> {
+    let mut c = Cur::new(span);
+    let mut rows = Vec::with_capacity(nrows);
+    let mut prev = 0u32;
+    for i in 0..nrows {
+        let delta = varint_read(&mut c).expect("validated at decode");
+        let row = if i == 0 { delta } else { prev + delta };
+        rows.push(row);
+        prev = row;
+    }
+    debug_assert!(c.at_end(), "validated span length");
+    rows
 }
 
 /// How row texts are sourced when materializing a `Record`. `None` on the
@@ -595,15 +661,38 @@ impl SegmentColumns {
         // Text predicate: resolve through the token postings index. The
         // candidate rows are EXACT for the text predicate (encode-time
         // tokenizer == query tokenizer), so only the other predicates need
-        // checking per candidate — and a text query skips the block walk
-        // entirely (text is selective; candidates are already few).
+        // checking per candidate. D7-a: candidates first merge against the
+        // blocks surviving the OTHER predicates' zone tests (both sides are
+        // ascending, so it is one linear walk) — a COMMON token composed
+        // with a selective time/label predicate no longer pays per-row
+        // checks inside dead blocks.
         if let Some(q) = &spec.text_match {
             let want = crate::text::fts_tokens(q);
             let Some(idx) = &self.tokens else {
                 return Vec::new(); // segment has no text at all
             };
+            let live_blocks: Vec<&BlockMeta> = self
+                .blocks
+                .iter()
+                .filter(|b| self.block_may_match(b, spec, &dict_prune))
+                .collect();
+            let mut block_iter = live_blocks.iter().peekable();
             let mut out: Vec<u32> = Vec::new();
             'cand: for row in idx.rows_matching_all(&want) {
+                // Advance to the block that could hold `row`; a candidate
+                // before the next live block is inside a pruned one.
+                while let Some(b) = block_iter.peek() {
+                    if b.end <= row {
+                        block_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                match block_iter.peek() {
+                    None => break 'cand, // no live blocks remain
+                    Some(b) if b.start > row => continue 'cand,
+                    Some(_) => {}
+                }
                 let i = row as usize;
                 if let Some((lo, hi)) = time {
                     let t = self.timestamps[i];
@@ -1293,23 +1382,51 @@ fn varint_read(c: &mut Cur) -> Result<u32> {
     }
 }
 
-/// Encode the K_TOKENS section from a built [`TokenIndex`]:
-/// `[u32 ntokens]` then per token `[u32 len][utf8][u32 nrows][deltas…]`
-/// where deltas are LEB128: first row id as-is, then successive gaps.
+/// The K_TOKENS v2 body sentinel (D7-b). A v1 body starts with `ntokens`,
+/// which can never be `u32::MAX` (4 billion distinct tokens exceeds every
+/// section bound), so the sentinel is unambiguous version detection —
+/// headerless bodies stay readable as v1 forever, an unknown FUTURE version
+/// is a LOUD corrupt error (never a silent "segment has no text index":
+/// silently-empty text matches would be data loss dressed as no-results).
+const TOKENS_V2_SENTINEL: u32 = u32::MAX;
+const TOKENS_VERSION: u32 = 2;
+
+/// Encode the K_TOKENS section (v2, D7-b):
+/// `[u32 SENTINEL][u32 version][u32 ntokens]`, the token DIRECTORY — per
+/// token `[u32 len][utf8][u32 nrows][u32 off][u32 len]` (offsets into the
+/// postings blob) — then `[u32 blob_len][blob]` where each token's span is
+/// its LEB128 delta list (first row as-is, then gaps). Splitting directory
+/// from blob is what lets a reader resolve query tokens without decoding
+/// anyone else's postings.
 fn encode_tokens(idx: &TokenIndex) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&(idx.tokens.len() as u32).to_le_bytes());
-    for (t, rows) in idx.tokens.iter().zip(&idx.postings) {
-        body.extend_from_slice(&(t.len() as u32).to_le_bytes());
-        body.extend_from_slice(t.as_bytes());
-        body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    let Postings::Eager(lists) = &idx.postings else {
+        unreachable!("encode always runs on a freshly built (eager) index");
+    };
+    let mut blob = Vec::new();
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(lists.len());
+    for rows in lists {
+        let start = blob.len();
         let mut prev = 0u32;
         for (i, &row) in rows.iter().enumerate() {
             let delta = if i == 0 { row } else { row - prev };
-            varint_push(&mut body, delta);
+            varint_push(&mut blob, delta);
             prev = row;
         }
+        spans.push((start as u32, (blob.len() - start) as u32));
     }
+    let mut body = Vec::new();
+    body.extend_from_slice(&TOKENS_V2_SENTINEL.to_le_bytes());
+    body.extend_from_slice(&TOKENS_VERSION.to_le_bytes());
+    body.extend_from_slice(&(idx.tokens.len() as u32).to_le_bytes());
+    for ((t, rows), (off, len)) in idx.tokens.iter().zip(lists).zip(&spans) {
+        body.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        body.extend_from_slice(t.as_bytes());
+        body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        body.extend_from_slice(&off.to_le_bytes());
+        body.extend_from_slice(&len.to_le_bytes());
+    }
+    body.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+    body.extend_from_slice(&blob);
     body
 }
 
@@ -1317,7 +1434,18 @@ fn encode_tokens(idx: &TokenIndex) -> Vec<u8> {
 /// strictly ascending within `count`.
 fn decode_tokens(body: &[u8], count: usize) -> Result<TokenIndex> {
     let mut c = Cur::new(body);
-    let n = c.u32()? as usize;
+    let first = c.u32()?;
+    if first == TOKENS_V2_SENTINEL {
+        let version = c.u32()?;
+        if version != TOKENS_VERSION {
+            // Unknown FUTURE layout: fail CLOSED. Reading it as "no text
+            // index" would serve silently-empty matches.
+            return Err(corrupt("unsupported K_TOKENS version"));
+        }
+        return decode_tokens_v2(c, count);
+    }
+    // Headerless = legacy v1 (`first` is ntokens): eager decode, forever.
+    let n = first as usize;
     let mut tokens: Vec<String> = Vec::with_capacity(n.min(1 << 20));
     let mut postings: Vec<Vec<u32>> = Vec::with_capacity(n.min(1 << 20));
     for _ in 0..n {
@@ -1352,7 +1480,79 @@ fn decode_tokens(body: &[u8], count: usize) -> Result<TokenIndex> {
         tokens.push(tok);
         postings.push(rows);
     }
-    Ok(TokenIndex { tokens, postings })
+    Ok(TokenIndex {
+        tokens,
+        postings: Postings::Eager(postings),
+    })
+}
+
+/// Decode a v2 K_TOKENS body (cursor past sentinel+version): parse the
+/// directory, keep the postings BLOB undecoded, and validate every span
+/// completely — ascending in-range rows, exact byte lengths — so the lazy
+/// per-query reads (`decode_posting_list`) are infallible by construction.
+fn decode_tokens_v2(mut c: Cur<'_>, count: usize) -> Result<TokenIndex> {
+    let n = c.u32()? as usize;
+    let mut tokens: Vec<String> = Vec::with_capacity(n.min(1 << 20));
+    let mut spans: Vec<(u32, u32, u32)> = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let tlen = c.u32()? as usize;
+        let tok =
+            String::from_utf8(c.take(tlen)?.to_vec()).map_err(|_| corrupt("token not utf8"))?;
+        if let Some(last) = tokens.last() {
+            if *last >= tok {
+                return Err(corrupt("token dictionary not sorted"));
+            }
+        }
+        let nrows = c.u32()?;
+        let off = c.u32()?;
+        let len = c.u32()?;
+        tokens.push(tok);
+        spans.push((off, len, nrows));
+    }
+    let blob_len = c.u32()? as usize;
+    let blob = c.take(blob_len)?.to_vec();
+    if !c.at_end() {
+        return Err(corrupt("trailing bytes after postings blob"));
+    }
+    // Validate every span now: the lazy read path never re-checks.
+    for &(off, len, nrows) in &spans {
+        let end = (off as usize)
+            .checked_add(len as usize)
+            .ok_or_else(|| corrupt("span overflow"))?;
+        if end > blob.len() {
+            return Err(corrupt("posting span out of blob"));
+        }
+        let mut sc = Cur::new(&blob[off as usize..end]);
+        let mut prev = 0u32;
+        for i in 0..nrows {
+            let delta = varint_read(&mut sc)?;
+            let row = if i == 0 {
+                delta
+            } else {
+                if delta == 0 {
+                    return Err(corrupt("postings not strictly ascending"));
+                }
+                prev.checked_add(delta)
+                    .ok_or_else(|| corrupt("posting overflow"))?
+            };
+            if row as usize >= count {
+                return Err(corrupt("posting row out of range"));
+            }
+            prev = row;
+        }
+        if !sc.at_end() {
+            return Err(corrupt("posting span length mismatch"));
+        }
+    }
+    let decoded = spans.iter().map(|_| std::sync::OnceLock::new()).collect();
+    Ok(TokenIndex {
+        tokens,
+        postings: Postings::Lazy {
+            blob,
+            spans,
+            decoded,
+        },
+    })
 }
 
 fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
@@ -1510,6 +1710,9 @@ impl<'a> Cur<'a> {
     }
     fn rest(&self) -> &'a [u8] {
         &self.b[self.p..]
+    }
+    fn at_end(&self) -> bool {
+        self.p == self.b.len()
     }
 }
 
@@ -2364,13 +2567,28 @@ mod tests {
             if rng() % 4 != 0 {
                 numerics.insert("latency_ms".to_string(), (rng() % 2000) as f64);
             }
+            // Text on ~half the rows: a COMMON token ("beta", the D7-a
+            // block-merge stressor) plus a sparse one — so composed
+            // text+time/label specs cross block boundaries with dead blocks.
+            let text = match rng() % 4 {
+                0 | 1 => Some(format!(
+                    "beta note {}",
+                    ["billing", "zebra"][(rng() % 2) as usize]
+                )),
+                2 => Some("plain filler".to_string()),
+                _ => None,
+            };
             records.push(Record {
                 key: format!("k/{i:06}"),
-                timestamp: (rng() % 1_000_000) as i64,
+                // Ascending with the (key-sorted) row order, so per-block
+                // timestamp ranges are DISJOINT and a time window really
+                // prunes blocks — the shape D7-a's candidate merge exists
+                // for (random timestamps would leave every block alive).
+                timestamp: (i as i64) * 100,
                 labels,
                 numerics,
                 payload: vec![0u8; 4],
-                text: None,
+                text,
             });
         }
         let mut sorted = records.clone();
@@ -2405,6 +2623,40 @@ mod tests {
                 labels: vec![("model".into(), "missing".into())],
                 ..Default::default()
             },
+            // D7-a shapes: the common token alone, composed with a narrow
+            // time window (most blocks dead), with a label, with a prefix,
+            // and a two-token AND with a sparse partner.
+            QuerySpec {
+                text_match: Some("beta".into()),
+                ..Default::default()
+            },
+            QuerySpec {
+                text_match: Some("beta".into()),
+                time: Some((0, 50_000)),
+                ..Default::default()
+            },
+            QuerySpec {
+                text_match: Some("beta".into()),
+                labels: vec![("model".into(), "gpt-4o".into())],
+                numeric_ranges: vec![("latency_ms".into(), 1500.0, f64::MAX)],
+                ..Default::default()
+            },
+            QuerySpec {
+                text_match: Some("beta".into()),
+                key_prefix: Some("k/0004".into()),
+                ..Default::default()
+            },
+            QuerySpec {
+                text_match: Some("beta zebra".into()),
+                time: Some((100_000, 900_000)),
+                ..Default::default()
+            },
+            // Every block dead: the merge's no-live-blocks early exit.
+            QuerySpec {
+                text_match: Some("beta".into()),
+                time: Some((2_000_000, 3_000_000)),
+                ..Default::default()
+            },
         ];
         for spec in &specs {
             let mut oracle: Vec<String> = sorted
@@ -2422,6 +2674,105 @@ mod tests {
             got.sort();
             assert_eq!(got, oracle, "spec {spec:?}");
         }
+    }
+
+    /// The pre-D7-b headerless K_TOKENS body (written by every earlier
+    /// binary) must decode forever, and must answer identically to the v2
+    /// lazy layout for the same data.
+    #[test]
+    fn tokens_v1_body_reads_forever_and_matches_v2() {
+        fn tokened(i: usize, text: &str) -> Record {
+            Record {
+                key: format!("k/{i:03}"),
+                timestamp: i as i64,
+                labels: BTreeMap::new(),
+                numerics: BTreeMap::new(),
+                payload: vec![],
+                text: Some(text.to_string()),
+            }
+        }
+        let records: Vec<Record> = (0..200)
+            .map(|i| tokened(i, ["alpha beta", "beta gamma", "gamma delta"][i % 3]))
+            .collect();
+        let idx = TokenIndex::build(&records);
+
+        // Hand-encode the v1 layout: [ntokens] then per token
+        // [len][utf8][nrows][LEB deltas] — the exact pre-D7-b writer.
+        let Postings::Eager(lists) = &idx.postings else {
+            unreachable!("build is eager")
+        };
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&(idx.tokens.len() as u32).to_le_bytes());
+        for (t, rows) in idx.tokens.iter().zip(lists) {
+            v1.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            v1.extend_from_slice(t.as_bytes());
+            v1.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            let mut prev = 0u32;
+            for (i, &row) in rows.iter().enumerate() {
+                let delta = if i == 0 { row } else { row - prev };
+                varint_push(&mut v1, delta);
+                prev = row;
+            }
+        }
+        let from_v1 = decode_tokens(&v1, records.len()).unwrap();
+        let from_v2 = decode_tokens(&encode_tokens(&idx), records.len()).unwrap();
+        assert!(matches!(from_v1.postings, Postings::Eager(_)));
+        assert!(matches!(from_v2.postings, Postings::Lazy { .. }));
+        for want in [
+            vec!["beta".to_string()],
+            vec!["beta".to_string(), "gamma".to_string()],
+            vec!["alpha".to_string(), "delta".to_string()], // disjoint ⇒ empty
+            vec!["nope".to_string()],
+        ] {
+            let a = from_v1.rows_matching_all(&want);
+            let b = from_v2.rows_matching_all(&want);
+            let c = idx.rows_matching_all(&want);
+            assert_eq!(a, b, "v1 vs v2 lazy: {want:?}");
+            assert_eq!(a, c, "v1 vs built eager: {want:?}");
+        }
+    }
+
+    /// An unknown FUTURE K_TOKENS version is a LOUD corrupt error — never a
+    /// silent "segment has no text index" (silently-empty matches would be
+    /// data loss dressed as no-results).
+    #[test]
+    fn tokens_unknown_future_version_fails_closed() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&TOKENS_V2_SENTINEL.to_le_bytes());
+        body.extend_from_slice(&(TOKENS_VERSION + 1).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let err = match decode_tokens(&body, 10) {
+            Err(e) => e,
+            Ok(_) => panic!("future version must fail closed"),
+        };
+        assert!(
+            err.to_string().contains("unsupported K_TOKENS version"),
+            "loud version error, got: {err}"
+        );
+    }
+
+    /// v2 span validation happens at decode, exhaustively: a blob whose
+    /// postings point out of range fails the SECTION decode, so the lazy
+    /// per-query reads never see invalid bytes.
+    #[test]
+    fn tokens_v2_validates_spans_at_decode() {
+        let records: Vec<Record> = (0..8)
+            .map(|i| Record {
+                key: format!("k/{i}"),
+                timestamp: i as i64,
+                labels: BTreeMap::new(),
+                numerics: BTreeMap::new(),
+                payload: vec![],
+                text: Some("alpha".to_string()),
+            })
+            .collect();
+        let good = encode_tokens(&TokenIndex::build(&records));
+        // Row ids valid for 8 rows are invalid for a 4-row segment.
+        assert!(decode_tokens(&good, 4).is_err(), "out-of-range postings");
+        assert!(decode_tokens(&good, 8).is_ok());
+        // Truncating the blob breaks a span's byte length: loud at decode.
+        let truncated = &good[..good.len() - 1];
+        assert!(decode_tokens(truncated, 8).is_err(), "truncated blob");
     }
 
     #[test]

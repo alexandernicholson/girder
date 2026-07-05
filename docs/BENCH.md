@@ -65,6 +65,25 @@ The corpus now carries a text document on every record, so these numbers
 INCLUDE the cost of writing K_TEXT + K_TOKENS on every segment — the build
 throughput and write-amp above are the honest with-FTS figures.
 
+### D7 re-run (2026-07-06, K_TOKENS v2 lazy postings + block-aware text candidates)
+
+| leg | D7 | vs baseline |
+|---|---|---|
+| fts selective | cold 29.20 ms (58.9 MB) · warm p50 **848 µs** | parity (834 µs) |
+| fts broad (~25%, unsorted) | warm p50 **385 ms** | −14% (450 ms) |
+| fts + label composed | warm p50 **361 µs** | see noise note |
+| build / write-amp | 12.15 s / 1.63× | parity |
+
+Noise note: same-run CONTROL legs that D7 does not touch drifted +15–22%
+(non-FTS selective warm 3.43 ms vs 2.8 ms baseline; put-ack p50 42 µs vs
+36 µs) — the box was under concurrent load. The composed leg's 361 µs vs
+297 µs sits inside that envelope. Honesty note on the design: the first
+D7-b cut decoded queried postings PER QUERY and regressed the warm FTS
+legs (977 µs / 439 µs) — caught by this re-run and fixed with per-token
+decode-once (`OnceLock`); the lazy layout's real target is the 10M shape
+(cold decode + memory), re-measured when the 10M soak rides the bench
+slice.
+
 ## The rivet-seam baselines (search-bench, 2026-07-05)
 
 Cross-store numbers measured through rivet's `SearchIndex` seam

@@ -32,7 +32,7 @@ fn record(i: usize) -> Record {
         // FTS document (message-content stand-in). `zebracorn` marks ~0.1%
         // of records — the selective FTS leg; the phrase pool gives common
         // tokens for the broad leg.
-        text: Some(if i % 1000 == 0 {
+        text: Some(if i.is_multiple_of(1000) {
             format!("user asked about billing zebracorn case {i}")
         } else {
             [

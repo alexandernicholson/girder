@@ -102,6 +102,15 @@ pub struct QuerySpec {
     /// `Some(_)` with `limit > 0` engages a bounded top-k heap that never
     /// materializes the full match set (see `Girder::scan`).
     pub order_by: Option<OrderBy>,
+    /// Keyset resume bound: return only rows STRICTLY AFTER `(timestamp,
+    /// key)` in the effective timestamp order — for `TimestampDesc` (and
+    /// `order_by: None`) that is `ts < bound.0 || (ts == bound.0 && key >
+    /// bound.1)`; for `TimestampAsc` the mirror. Pages chained through it
+    /// are stable under concurrent ingest (a new write lands before or
+    /// after the bound, never inside an already-served page). Only
+    /// meaningful with timestamp orders; numeric orders ignore it (callers
+    /// must not combine them — see `Girder::scan`).
+    pub after: Option<(i64, String)>,
     /// Full-text predicate over `Record.text`: every token of this query
     /// (per [`crate::text::fts_tokens`]) must appear among the record's text
     /// tokens — AND semantics, case-insensitive, exact token equality. A
@@ -112,6 +121,23 @@ pub struct QuerySpec {
 }
 
 impl QuerySpec {
+    /// Does `record` fall strictly after the keyset bound in the effective
+    /// timestamp order? (True when no bound is set.) Ordering-scoped — NOT
+    /// part of [`QuerySpec::matches`], which stays a pure match predicate.
+    pub fn after_bound_ok(&self, record: &Record) -> bool {
+        let Some((bound_ts, bound_key)) = &self.after else {
+            return true;
+        };
+        let asc = matches!(self.order_by, Some(OrderBy::TimestampAsc));
+        if asc {
+            record.timestamp > *bound_ts
+                || (record.timestamp == *bound_ts && record.key > *bound_key)
+        } else {
+            record.timestamp < *bound_ts
+                || (record.timestamp == *bound_ts && record.key > *bound_key)
+        }
+    }
+
     /// The full predicate — the naive-scan ORACLE (fields + text). Backends
     /// of the text predicate (segment token index, memtable token map) must
     /// agree with this exactly.

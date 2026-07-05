@@ -533,6 +533,18 @@ impl Girder {
     /// of materializing every match, and — for `TimestampDesc` — stops early
     /// once no unvisited (older) segment can beat the weakest kept row.
     pub async fn scan(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
+        if spec.after.is_some()
+            && matches!(
+                spec.order_by,
+                Some(OrderBy::NumericAsc(_)) | Some(OrderBy::NumericDesc(_))
+            )
+        {
+            // The keyset bound is defined over the timestamp order only —
+            // silently ignoring it would serve wrong pages.
+            return Err(GirderError::Config(
+                "QuerySpec.after requires a timestamp order".into(),
+            ));
+        }
         self.retry_vanished(|| {
             // Counters in range → the fold path. Predicate narrowing is
             // UNSOUND over raw delta rows (a delta's zone-mapped numeric is
@@ -657,7 +669,7 @@ impl Girder {
             .map(|f| match f {
                 Fold::Done(r) | Fold::Pending(r) => finish_fold(r),
             })
-            .filter(|r| spec.matches(r))
+            .filter(|r| spec.matches(r) && spec.after_bound_ok(r))
             .collect();
         let order = spec.order_by.as_ref();
         out.sort_by(|a, b| record_cmp(order, a, b));
@@ -681,7 +693,10 @@ impl Girder {
             let memtable = self.inner.memtable.read().unwrap();
             let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for record in memtable.values() {
-                if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                if seen.insert(record.key.clone())
+                    && mem_matches(spec, record, cand.as_ref())
+                    && spec.after_bound_ok(record)
+                {
                     out.push(record.clone());
                 }
             }
@@ -691,7 +706,10 @@ impl Girder {
             for (_, map) in frozen.iter().rev() {
                 let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for record in map.values() {
-                    if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                    if seen.insert(record.key.clone())
+                        && mem_matches(spec, record, cand.as_ref())
+                        && spec.after_bound_ok(record)
+                    {
                         out.push(record.clone());
                     }
                 }
@@ -717,6 +735,9 @@ impl Girder {
                 for &row in &rows {
                     let r = row as usize;
                     if !seen.contains(cols.key_at(r)) {
+                        if !after_ok_cols(spec, cols.timestamp_at(r), cols.key_at(r)) {
+                            continue; // bound applies to the winning version
+                        }
                         out.push(cols.materialize(
                             r,
                             file.as_ref(),
@@ -778,7 +799,7 @@ impl Girder {
             let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for rec in memtable.values() {
                 let fresh = seen.insert(rec.key.clone());
-                if fresh && mem_matches(spec, rec, cand.as_ref()) {
+                if fresh && mem_matches(spec, rec, cand.as_ref()) && spec.after_bound_ok(rec) {
                     let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                     let prim = make_prim(order, rec.timestamp, num);
                     offer(&mut heap, limit, prim, &rec.key, || {
@@ -793,7 +814,7 @@ impl Girder {
                 let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for rec in map.values() {
                     let fresh = seen.insert(rec.key.clone());
-                    if fresh && mem_matches(spec, rec, cand.as_ref()) {
+                    if fresh && mem_matches(spec, rec, cand.as_ref()) && spec.after_bound_ok(rec) {
                         let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                         let prim = make_prim(order, rec.timestamp, num);
                         offer(&mut heap, limit, prim, &rec.key, || {
@@ -823,6 +844,9 @@ impl Girder {
                 let key = cols.key_at(r);
                 if seen.contains(key) {
                     continue; // shadowed by a newer source
+                }
+                if !after_ok_cols(spec, cols.timestamp_at(r), key) {
+                    continue; // keyset bound: post-LWW (shadow check above)
                 }
                 let num = numeric_name.and_then(|n| cols.numeric_at(n, r));
                 let prim = make_prim(order, cols.timestamp_at(r), num);
@@ -1285,6 +1309,19 @@ fn mem_matches(
     match cand {
         None => spec.matches(record),
         Some(c) => c.contains(record.key.as_str()) && spec.matches_fields(record),
+    }
+}
+
+/// Column-side keyset-bound check (same semantics as
+/// `QuerySpec::after_bound_ok`, without materializing the row).
+fn after_ok_cols(spec: &QuerySpec, ts: i64, key: &str) -> bool {
+    let Some((bound_ts, bound_key)) = &spec.after else {
+        return true;
+    };
+    if matches!(spec.order_by, Some(OrderBy::TimestampAsc)) {
+        ts > *bound_ts || (ts == *bound_ts && key > bound_key.as_str())
+    } else {
+        ts < *bound_ts || (ts == *bound_ts && key > bound_key.as_str())
     }
 }
 

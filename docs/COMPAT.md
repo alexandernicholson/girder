@@ -48,5 +48,12 @@ fabricates a full pre-versioning store — v1 segments, v0 manifest, a
 kill-mid-rewrite orphan — and drives it to convergence across restarts.
 
 Rivet-side control-plane *namespace* versioning (per-namespace schema
-versions inside payloads) is a separate, deferred concern — this document
-covers the engine's own container formats only.
+versions inside payloads) is a separate concern — this document covers the
+engine's own container formats only. The first instance lives in rivet
+(plan 0013 §6 D5): score records in the `sc/` namespace carry a PINNED set
+of index dimensions — labels `project`/`trace`/`source`/`name` + numeric
+`value`, timestamp = the score's `created_unix_nanos` — versioned by
+rivet's own `scv/format` marker with a one-shot restart-safe upgrade pass
+(marker written last; reads fall back to full scan until it says
+upgraded). Changing that set means a new marker version + a new pass on
+the rivet side; nothing about it is engine format.

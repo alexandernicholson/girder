@@ -56,7 +56,10 @@ and WAL replay — so **concurrent increments never lose an update**
   later concurrent increments (monotone counters: never less than this
   call's own contribution);
 - the `girder.` label prefix is reserved for the engine (the delta flag
-  rides `girder.delta`, stripped from every record the engine returns).
+  rides `girder.delta`, stripped from every record the engine returns);
+- scans that can touch counters run in fold mode: predicates, ordering and
+  limits apply to FOLDED totals only — **partial values must never rank**
+  (a raw delta never matches a filter, orders a page, or leaks out).
 
 ## Explicit non-guarantees
 

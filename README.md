@@ -77,6 +77,10 @@ construction, not by lock choreography:
   versions fail closed); legacy segments are rewritten to the current
   format one-per-tick, restart-safe by construction. `docs/COMPAT.md` has
   the full matrix.
+- **Blobs**: content-addressed `put_blob`/`get_blob`/`delete_blob` —
+  sha256-keyed file-per-hash outside the WAL (the hash is the integrity
+  check, verified on every read, fail-closed), manifest-tracked existence,
+  dedup by construction, explicit-delete-only. `docs/GUARANTEES.md` §Blobs.
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
 ## Upsert / merge semantics (public guarantee)

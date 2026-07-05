@@ -10,7 +10,7 @@ does.
 | Artifact | Detection | Versions | Written | Read | Old binary on new file |
 |---|---|---|---|---|---|
 | Segment | `[u32 "gird"][u32 ver]` header | v1 (whole-file rmp), v2 (columnar) | v2 | v1 + v2 | v2 refused with a clean version error |
-| Manifest | `[u32 "GMAN"][u32 ver]` prefix; no magic = v0 | v0 (bare rmp), v1 (headered rmp) | v1 | v0 + v1 | misparse → corrupt error (no silent damage: the manifest is never partially applied) |
+| Manifest | `[u32 "GMAN"][u32 ver]` prefix; no magic = v0 | v0 (bare rmp), v1 (headered), v2 (+ blob existence set) | v2 | v0 + v1 + v2 | v0-reader: misparse → corrupt error; v1-reader (B3): version check fails CLOSED (deliberate — silently rewriting a v2 manifest without its blob set would orphan every blob) |
 | WAL | `[u32 "GWAL"][u32 ver]` header; no header = v0 | v0 (bare frames), v1 (headered frames) | v1 (new files; appends to a v0 file keep it v0) | v0 + v1 | the magic decodes as a >1 GB frame length (cap: 64 MB) → replay stops cleanly at byte 0 |
 
 Segment section kinds are additionally forward-extensible WITHIN v2: the

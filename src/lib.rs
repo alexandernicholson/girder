@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 mod actors;
+mod blob;
 mod cache;
 mod engine;
 mod error;

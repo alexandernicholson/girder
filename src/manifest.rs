@@ -52,10 +52,18 @@ impl SegmentMeta {
 pub struct Manifest {
     pub next_segment_id: u64,
     pub segments: Vec<SegmentMeta>,
+    /// Content-addressed blobs that EXIST (sha256 ids) — the source of truth
+    /// for `get_blob`; an on-disk blob file not listed here is garbage.
+    /// Trailing + defaulted: v0/v1 manifests decode with an empty set.
+    #[serde(default)]
+    pub blobs: std::collections::BTreeSet<String>,
 }
 
 const MANIFEST_MAGIC: u32 = 0x4e41_4d47; // "GMAN"
-const MANIFEST_VERSION: u32 = 1;
+/// v1 = versioned header; v2 = + the `blobs` existence set (B4). The bump
+/// makes a pre-B4 binary FAIL CLOSED on a blobs-bearing manifest instead of
+/// silently rewriting it without the set (which would orphan every blob).
+const MANIFEST_VERSION: u32 = 2;
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest> {
@@ -123,6 +131,7 @@ mod tests {
         let manifest = Manifest {
             next_segment_id: 7,
             segments: Vec::new(),
+            blobs: Default::default(),
         };
 
         // v0 on disk → loads.

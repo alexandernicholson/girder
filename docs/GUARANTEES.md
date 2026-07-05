@@ -61,6 +61,26 @@ and WAL replay — so **concurrent increments never lose an update**
   limits apply to FOLDED totals only — **partial values must never rank**
   (a raw delta never matches a filter, orders a page, or leaks out).
 
+## Blobs (`put_blob` / `get_blob` / `delete_blob`)
+
+Content-addressed immutable byte objects, keyed by sha256, stored one file
+per hash under `blobs/` — OUTSIDE the WAL, memtable and segments (the hash
+IS the integrity check; content never churns the record machinery):
+
+- `put_blob` is idempotent: same content, same id, one file — dedup by
+  construction. Write is tmp→fsync→rename + a manifest listing, both under
+  the manifest lock.
+- **The manifest is the existence oracle**: `get_blob` of an unlisted hash
+  is `None` even if a file exists (kill residue = garbage, swept by the
+  maintenance tick under the same lock so a mid-put blob can never be
+  swept). A LISTED blob whose file is missing or whose content no longer
+  matches its hash is loud corruption — never `None`, never served bytes.
+- **Deletion is explicit only** (`delete_blob`, idempotent; manifest first,
+  then the file is garbage). No TTL applies to blobs: content addressing
+  means dedup, dedup means shared referents, and only the embedder knows
+  references — a TTL-from-last-put would delete under live references the
+  engine cannot see.
+
 ## Retention & grooming
 
 Retention is policy-as-data: `GirderConfig.retention` is a list of

@@ -197,6 +197,7 @@ impl MaintenanceActor {
                 self.tier()?;
                 self.groom()?;
                 self.migrate()?;
+                self.sweep_blob_orphans();
                 Ok(flushed)
             }
         }
@@ -654,6 +655,21 @@ impl MaintenanceActor {
         Ok(groomed)
     }
 
+    /// Delete blob files not listed in the manifest (kill residue from a
+    /// crash between file-rename and manifest-store). Holding the manifest
+    /// lock for the whole sweep excludes `put_blob` (which holds the WRITE
+    /// lock across its file-write + listing), so a mid-put blob can never
+    /// be swept; the sweep itself only reads, so a read lock suffices.
+    fn sweep_blob_orphans(&self) {
+        let manifest = self.inner.manifest.read().unwrap();
+        for hash in crate::blob::on_disk_hashes(&self.inner.config.hot_dir) {
+            if !manifest.blobs.contains(&hash) {
+                std::fs::remove_file(crate::blob::blob_path(&self.inner.config.hot_dir, &hash))
+                    .ok();
+            }
+        }
+    }
+
     /// Background format migration (docs/COMPAT.md): rewrite at most ONE
     /// under-versioned segment per tick to the current format — bounded work,
     /// restart-safe by construction (the rewrite is tmp→fsync→rename + an
@@ -896,6 +912,7 @@ mod tests {
         let mut manifest = Manifest {
             next_segment_id: 10,
             segments: Vec::new(),
+            blobs: Default::default(),
         };
         for seg in 0..3u64 {
             let records: Vec<Record> = (0..20)

@@ -9,6 +9,10 @@ description = "Embedded, actor-supervised storage engine for trace-shaped data, 
 rust-version = "1.90"
 
 [dependencies]
+# Content addressing for the blob namespace (B4): the hash IS the key and
+# the integrity check. RustCrypto's standard implementation - an algorithm
+# we buy, not a wire format we own.
+sha2 = "0.10"
 rebar-core = { git = "https://github.com/alexandernicholson/rebar", rev = "891ac5534140ee5b9eaa9391601859120779424f" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

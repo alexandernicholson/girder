@@ -135,6 +135,8 @@ pub struct Stats {
     pub groomed_segments: u64,
     /// Legacy-format segments rewritten to the current format.
     pub migrated_segments: u64,
+    /// Content-addressed blobs currently stored.
+    pub blobs: usize,
     pub tiered: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -332,6 +334,69 @@ impl Girder {
             self.kick_maintenance(MaintCall::FlushPending);
         }
         Ok(self.get(key).await?.map(|r| r.numerics).unwrap_or_default())
+    }
+
+    /// Store a content-addressed blob; returns its sha256-hex id. Content
+    /// lives OUTSIDE the WAL as one file per hash (the hash is the
+    /// integrity check); existence is manifest-tracked. Idempotent — same
+    /// content, same id, one file (dedup by construction). Deletion is
+    /// EXPLICIT only ([`Girder::delete_blob`]): dedup means shared
+    /// referents, and only the embedder knows references.
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<String> {
+        let hash = crate::blob::sha256_hex(bytes);
+        // File write + manifest add under the manifest write lock: the
+        // groomer's orphan sweep runs under the same lock, so a half-added
+        // blob can never be swept mid-put.
+        let mut manifest = self.inner.manifest.write().unwrap();
+        crate::blob::write_blob_file(&self.inner.config.hot_dir, &hash, bytes)?;
+        if manifest.blobs.insert(hash.clone()) {
+            self.inner.store_manifest(&manifest)?;
+        }
+        Ok(hash)
+    }
+
+    /// Fetch a blob by id. `None` = not stored (per the manifest — an
+    /// unlisted on-disk file is garbage, not data). A listed blob whose file
+    /// is missing or whose content no longer matches its hash is LOUD
+    /// corruption, never `None` and never garbage bytes.
+    pub async fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if !crate::blob::valid_hash(hash) {
+            return Ok(None);
+        }
+        {
+            let manifest = self.inner.manifest.read().unwrap();
+            if !manifest.blobs.contains(hash) {
+                return Ok(None);
+            }
+        }
+        match crate::blob::read_blob_file(&self.inner.config.hot_dir, hash) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(GirderError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(GirderError::Corrupt {
+                    what: "blob",
+                    detail: format!("manifest lists {hash} but the file is missing"),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove a blob (idempotent; returns whether it existed). Manifest
+    /// first — the file is garbage the moment the listing is durable, same
+    /// order as segment deletion.
+    pub async fn delete_blob(&self, hash: &str) -> Result<bool> {
+        let existed = {
+            let mut manifest = self.inner.manifest.write().unwrap();
+            let existed = manifest.blobs.remove(hash);
+            if existed {
+                self.inner.store_manifest(&manifest)?;
+            }
+            existed
+        };
+        if existed {
+            std::fs::remove_file(crate::blob::blob_path(&self.inner.config.hot_dir, hash)).ok();
+        }
+        Ok(existed)
     }
 
     /// Freeze + flush everything to segments (durable checkpoint).
@@ -1167,6 +1232,7 @@ impl Girder {
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
             groomed_segments: self.inner.stats_groomed.load(Ordering::Relaxed),
             migrated_segments: self.inner.stats_migrated.load(Ordering::Relaxed),
+            blobs: manifest.blobs.len(),
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),
             cache_hits: self.inner.stats_cache_hits.load(Ordering::Relaxed),
             cache_misses: self.inner.stats_cache_misses.load(Ordering::Relaxed),

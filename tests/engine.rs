@@ -1372,3 +1372,59 @@ async fn text_roundtrips_through_all_stages() {
         "post-close-reopen",
     );
 }
+
+/// Fat-record compaction CONVERGES (D1 soak finding): when records are big
+/// enough that `max_segment_bytes` trips before `max_segment_records`, the
+/// byte cap must also SEAL — a record-count-only seal never fires, and
+/// compaction re-merges the whole hot set on every tick (unbounded
+/// write-amp; observed as 1,135 segment writes for a 1M-record build).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fat_record_compaction_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::EveryN(64);
+    cfg.memtable_max_records = 20; // 20 x 1KB = ~20KB flushed segments
+    cfg.compact_min_segments = 3;
+    cfg.max_segment_records = 1_000; // never reached: bytes trip first
+    cfg.max_segment_bytes = 128 * 1024; // outputs seal at >= 64KB (cap/2)
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = Girder::open(cfg).await.unwrap();
+
+    for i in 0..400usize {
+        engine.put(big_record(i, 1024)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    // Settle: consolidate until a full pass does nothing.
+    let mut settled = 0;
+    for _ in 0..50 {
+        let before = engine.stats().compactions;
+        engine.maintain().await.unwrap();
+        if engine.stats().compactions == before {
+            settled += 1;
+            if settled >= 2 {
+                break;
+            }
+        } else {
+            settled = 0;
+        }
+    }
+    let at_convergence = engine.stats();
+    assert!(
+        settled >= 2,
+        "compaction never converged: {at_convergence:?}"
+    );
+
+    // Converged = further passes are no-ops, forever.
+    for _ in 0..5 {
+        engine.maintain().await.unwrap();
+    }
+    let after = engine.stats();
+    assert_eq!(
+        after.compactions, at_convergence.compactions,
+        "sealed segments must never re-merge: {after:?}"
+    );
+    // And the data is intact.
+    let all = engine.scan(&QuerySpec::default()).await.unwrap();
+    assert_eq!(all.len(), 400);
+}

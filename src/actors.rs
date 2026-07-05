@@ -425,13 +425,25 @@ impl MaintenanceActor {
             min_seg.max(2)
         };
 
-        // A segment already at the record cap is "sealed": compacting it with
-        // peers would just rewrite disjoint key ranges (no dedupe, no shrink),
-        // so re-merging same-size cap segments forever is pure write
+        // A segment already at EITHER output cap is "sealed": compacting it
+        // with peers would just rewrite disjoint key ranges (no dedupe, no
+        // shrink), so re-merging cap-sized segments forever is pure write
         // amplification. Excluding sealed segments bounds write-amp to
         // small→cap (~2-3×) and the live segment count to ≈ n / cap + tail.
+        //
+        // BOTH caps matter: `split_chunks` splits outputs at whichever of
+        // max_segment_records / max_segment_bytes trips FIRST, so with fat
+        // records (rivet spans + their FTS text ≈ 3 KB) the byte cap seals
+        // long before the record cap is reachable — a record-count-only
+        // predicate then never seals anything and compaction re-merges the
+        // whole hot set on every pass (unbounded write-amp; found by the D1
+        // 10M soak: 1,135 segment writes for a 1M-record build). The byte
+        // seal uses half the cap: any output at ≥ max_segment_bytes/2 can
+        // only ever merge into ≤2-input rewrites — churn, not consolidation.
         let cap = self.inner.config.max_segment_records.max(1);
-        let mergeable = |m: &&SegmentMeta| m.tier == Tier::Hot && m.zone.count < cap;
+        let byte_seal = (self.inner.config.max_segment_bytes / 2).max(1);
+        let mergeable =
+            |m: &&SegmentMeta| m.tier == Tier::Hot && m.zone.count < cap && m.bytes < byte_seal;
 
         // Global recency order.
         let mut all: Vec<&SegmentMeta> = segments.iter().collect();

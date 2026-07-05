@@ -156,6 +156,59 @@ impl QuerySpec {
     }
 }
 
+/// Reserved label marking a **delta record** (a counter increment written by
+/// [`crate::Girder::incr`]): its numerics ADD onto the key's current value
+/// instead of replacing it. The label rides the existing wire format (zero
+/// format change: WAL, v1 and v2 segments, zone maps all carry it for free —
+/// and the zone-map label set is how reads detect "deltas possible here").
+/// The `girder.` label prefix is reserved for the engine.
+pub const DELTA_LABEL: &str = "girder.delta";
+
+impl Record {
+    /// Is this a delta (increment) record rather than a full value?
+    pub fn is_delta(&self) -> bool {
+        self.labels.get(DELTA_LABEL).map(String::as_str) == Some("1")
+    }
+
+    pub(crate) fn set_delta(&mut self) {
+        self.labels.insert(DELTA_LABEL.to_string(), "1".to_string());
+    }
+
+    fn clear_delta(&mut self) {
+        self.labels.remove(DELTA_LABEL);
+    }
+}
+
+/// Fold a delta record onto an (optional) earlier version of its key — the
+/// single merge oracle used by the memtable, the read paths, compaction and
+/// WAL replay, so they cannot disagree:
+///
+/// - numerics ADD (union of names; missing = 0);
+/// - identity fields (labels / payload / text) come from the BASE when one
+///   exists — a delta only adds numbers; when the delta CREATES the row, its
+///   own fields seed it;
+/// - `timestamp` = max (a counter's time is its latest activity — folding an
+///   out-of-order delta must not age the row into retention);
+/// - the result stays delta-flagged iff there was no base (its true base may
+///   live in an older, unseen source) and the earlier version was itself a
+///   delta or absent.
+pub(crate) fn merge_delta(base: Option<&Record>, delta: &Record) -> Record {
+    match base {
+        None => delta.clone(),
+        Some(base) => {
+            let mut merged = base.clone();
+            for (name, v) in &delta.numerics {
+                *merged.numerics.entry(name.clone()).or_insert(0.0) += v;
+            }
+            merged.timestamp = merged.timestamp.max(delta.timestamp);
+            if !base.is_delta() {
+                merged.clear_delta();
+            }
+            merged
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

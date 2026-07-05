@@ -169,7 +169,16 @@ impl Girder {
         let mut recovered: BTreeMap<String, Record> = BTreeMap::new();
         for seq in &wal_seqs {
             for record in Wal::replay(&config.hot_dir.join(format!("wal-{seq:016}.log")))? {
-                recovered.insert(record.key.clone(), record);
+                if record.is_delta() {
+                    // Same fold oracle as the live write path (merge_delta), so
+                    // replay reconstructs exactly what the memtable held. The
+                    // result may STAY delta-flagged (base in a segment) — the
+                    // checkpoint segment then carries it and reads keep folding.
+                    let folded = crate::record::merge_delta(recovered.get(&record.key), &record);
+                    recovered.insert(record.key.clone(), folded);
+                } else {
+                    recovered.insert(record.key.clone(), record);
+                }
             }
         }
         let next_wal_seq = wal_seqs.last().map(|s| s + 1).unwrap_or(0);
@@ -268,6 +277,47 @@ impl Girder {
         self.put_batch(vec![record]).await
     }
 
+    /// Atomic counter increment: add `deltas` onto `key`'s numerics (creating
+    /// the record if absent), serialized through the single writer — two
+    /// concurrent `incr`s can never lose an update (unlike a read-modify-write
+    /// `get`+`put`). Durable like any write: the delta is WAL-appended before
+    /// the ack, and folded via the single `merge_delta` oracle shared by the
+    /// memtable, reads, compaction and WAL replay.
+    ///
+    /// Returns the post-increment numerics. The returned snapshot is read
+    /// after the ack and may already include later concurrent increments —
+    /// benign for monotone counters (never LESS than this call's own
+    /// contribution).
+    ///
+    /// Ordinary `put`s keep last-write-wins: a full record REPLACES any
+    /// accumulated value (`docs/GUARANTEES.md` holds unchanged).
+    pub async fn incr(
+        &self,
+        key: &str,
+        timestamp: i64,
+        deltas: BTreeMap<String, f64>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let mut record = Record {
+            key: key.to_string(),
+            timestamp,
+            labels: BTreeMap::new(),
+            numerics: deltas,
+            payload: Vec::new(),
+            text: None,
+        };
+        record.set_delta();
+        let frozen = self
+            .writer
+            .call(WriterMsg::Incr(record), CALL_TIMEOUT)
+            .await
+            .map_err(|_| GirderError::ShutDown)?
+            .map_err(GirderError::Encode)?;
+        if frozen.is_some() {
+            self.kick_maintenance(MaintCall::FlushPending);
+        }
+        Ok(self.get(key).await?.map(|r| r.numerics).unwrap_or_default())
+    }
+
     /// Freeze + flush everything to segments (durable checkpoint).
     pub async fn flush(&self) -> Result<()> {
         self.writer
@@ -332,14 +382,42 @@ impl Girder {
     }
 
     fn get_once(&self, key: &str) -> Result<Option<Record>> {
+        // Newest→oldest walk. `pending` accumulates delta-flagged versions
+        // until a full record (the base) is found; a full hit with no pending
+        // deltas returns immediately (the historical fast path, unchanged
+        // when no counters are in play).
+        let mut pending: Option<Record> = None;
+        let fold = |pending: &mut Option<Record>, version: &Record| -> Option<Record> {
+            match pending.take() {
+                None if !version.is_delta() => Some(version.clone()),
+                None => {
+                    *pending = Some(version.clone());
+                    None
+                }
+                Some(p) => {
+                    // `p` is the fold of all NEWER deltas; `version` is older.
+                    let merged = crate::record::merge_delta(Some(version), &p);
+                    if merged.is_delta() {
+                        *pending = Some(merged);
+                        None
+                    } else {
+                        Some(merged)
+                    }
+                }
+            }
+        };
         if let Some(record) = self.inner.memtable.read().unwrap().get(key) {
-            return Ok(Some(record.clone()));
+            if let Some(done) = fold(&mut pending, record) {
+                return Ok(Some(finish_fold(done)));
+            }
         }
         {
             let frozen = self.inner.frozen.read().unwrap();
             for (_, map) in frozen.iter().rev() {
                 if let Some(record) = map.get(key) {
-                    return Ok(Some(record.clone()));
+                    if let Some(done) = fold(&mut pending, record) {
+                        return Ok(Some(finish_fold(done)));
+                    }
                 }
             }
         }
@@ -347,18 +425,18 @@ impl Girder {
             key_prefix: Some(key.to_string()),
             ..Default::default()
         };
-        // Newest-id first: the first segment that holds the key wins.
+        // Newest-id first.
         for meta in self.pruned_segments(&spec) {
             let (cols, file) = self.load_segment(&meta, false)?;
             if let Some(idx) = cols.find_key(key) {
-                return Ok(Some(cols.materialize(
-                    idx,
-                    file.as_ref(),
-                    &self.inner.stats_bytes_read,
-                )?));
+                let record = cols.materialize(idx, file.as_ref(), &self.inner.stats_bytes_read)?;
+                if let Some(done) = fold(&mut pending, &record) {
+                    return Ok(Some(finish_fold(done)));
+                }
             }
         }
-        Ok(None)
+        // A delta chain with no base = the row as created by increments.
+        Ok(pending.map(finish_fold))
     }
 
     /// Scan matching records.
@@ -375,6 +453,16 @@ impl Girder {
     /// once no unvisited (older) segment can beat the weakest kept row.
     pub async fn scan(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
         self.retry_vanished(|| {
+            // Counters in range → the fold path. Predicate narrowing is
+            // UNSOUND over raw delta rows (a delta's zone-mapped numeric is
+            // the increment, not the total; a base outside the time window
+            // still feeds a fold inside it), so fold-mode narrows by key
+            // prefix only, folds, then applies the full spec. When no deltas
+            // exist anywhere in range — every pure-trace workload — this is
+            // one boolean check and the historical paths run unchanged.
+            if self.deltas_possible(spec) {
+                return self.scan_fold(spec);
+            }
             if spec.limit > 0 {
                 if let Some(order) = &spec.order_by {
                     return self.scan_topk(spec, order);
@@ -382,6 +470,120 @@ impl Girder {
             }
             self.scan_full(spec)
         })
+    }
+
+    /// Any delta-flagged records among the sources this spec's key range can
+    /// touch? Conservative superset: memtable/frozen delta presence, or a
+    /// prefix-overlapping segment whose zone-map label set carries the
+    /// reserved delta label (`Some(None)` = cardinality-overflow = can't rule
+    /// out).
+    fn deltas_possible(&self, spec: &QuerySpec) -> bool {
+        if self.inner.memtable.read().unwrap().has_deltas() {
+            return true;
+        }
+        if self
+            .inner
+            .frozen
+            .read()
+            .unwrap()
+            .iter()
+            .any(|(_, m)| m.has_deltas())
+        {
+            return true;
+        }
+        let prefix_only = QuerySpec {
+            key_prefix: spec.key_prefix.clone(),
+            ..Default::default()
+        };
+        let manifest = self.inner.manifest.read().unwrap();
+        manifest.segments.iter().any(|m| {
+            m.zone.may_match(&prefix_only)
+                && match m.zone.labels.get(crate::record::DELTA_LABEL) {
+                    Some(Some(values)) => values.contains("1"),
+                    Some(None) => true,
+                    None => false,
+                }
+        })
+    }
+
+    /// Fold-mode scan: prefix-only narrowing, newest→oldest per-key delta
+    /// folding via the single `merge_delta` oracle, then the FULL spec
+    /// (labels/numerics/time/text/order/limit) applied to the folded records.
+    fn scan_fold(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
+        use std::collections::hash_map::Entry;
+        use std::collections::HashMap;
+        enum Fold {
+            Done(Record),
+            Pending(Record),
+        }
+        let mut states: HashMap<String, Fold> = HashMap::new();
+        let mut feed = |record: &Record| {
+            match states.entry(record.key.clone()) {
+                Entry::Vacant(v) => {
+                    if record.is_delta() {
+                        v.insert(Fold::Pending(record.clone()));
+                    } else {
+                        v.insert(Fold::Done(record.clone()));
+                    }
+                }
+                Entry::Occupied(mut o) => {
+                    if let Fold::Pending(p) = o.get() {
+                        // `p` folds all newer deltas; `record` is older.
+                        let merged = crate::record::merge_delta(Some(record), p);
+                        o.insert(if merged.is_delta() {
+                            Fold::Pending(merged)
+                        } else {
+                            Fold::Done(merged)
+                        });
+                    } // Done: older versions are shadowed (LWW).
+                }
+            }
+        };
+        let prefix = spec.key_prefix.as_deref();
+        let stripped = QuerySpec {
+            key_prefix: spec.key_prefix.clone(),
+            ..Default::default()
+        };
+        {
+            let memtable = self.inner.memtable.read().unwrap();
+            for record in memtable.values() {
+                if prefix.is_none_or(|p| record.key.starts_with(p)) {
+                    feed(record);
+                }
+            }
+        }
+        {
+            let frozen = self.inner.frozen.read().unwrap();
+            for (_, map) in frozen.iter().rev() {
+                for record in map.values() {
+                    if prefix.is_none_or(|p| record.key.starts_with(p)) {
+                        feed(record);
+                    }
+                }
+            }
+        }
+        for meta in self.pruned_segments(&stripped) {
+            let (cols, file) = self.load_segment(&meta, false)?;
+            for &row in &cols.matching_rows(&stripped) {
+                let record =
+                    cols.materialize(row as usize, file.as_ref(), &self.inner.stats_bytes_read)?;
+                feed(&record);
+            }
+        }
+
+        let mut out: Vec<Record> = states
+            .into_values()
+            .map(|f| match f {
+                Fold::Done(r) | Fold::Pending(r) => finish_fold(r),
+            })
+            .filter(|r| spec.matches(r))
+            .collect();
+        let order = spec.order_by.as_ref();
+        out.sort_by(|a, b| record_cmp(order, a, b));
+        if spec.limit > 0 {
+            out.truncate(spec.limit);
+        }
+        Ok(out)
     }
 
     /// Materialize every match, dedupe newest-wins, sort by the effective
@@ -973,6 +1175,14 @@ impl Girder {
             .ok();
         Ok(())
     }
+}
+
+/// A folded record leaving the engine: the reserved delta label is internal
+/// bookkeeping, never user data — strip it (a chain with no base IS the
+/// row's full current value).
+fn finish_fold(mut record: Record) -> Record {
+    record.labels.remove(crate::record::DELTA_LABEL);
+    record
 }
 
 /// The query's text tokens, when a text predicate is present.

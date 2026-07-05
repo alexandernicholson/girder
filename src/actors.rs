@@ -33,6 +33,10 @@ use crate::wal::Wal;
 
 pub enum WriterMsg {
     Append(Vec<Record>),
+    /// Counter increment: WAL-append the delta record, fold it into the
+    /// memtable (`MemTable::insert_delta`) — one serialized step, so
+    /// concurrent increments never lose an update.
+    Incr(Record),
     /// Force a freeze+rotate even below the threshold (shutdown/flush()).
     Freeze,
     Sync,
@@ -105,6 +109,23 @@ impl GenServer for WriterActor {
                 }
                 self.inner.note_put();
                 // 3. Freeze when full (serial with appends — no races).
+                let over = self.inner.memtable.read().unwrap().len()
+                    >= self.inner.config.memtable_max_records;
+                if over {
+                    return self.freeze(state);
+                }
+                Ok(None)
+            }
+            WriterMsg::Incr(record) => {
+                state
+                    .wal
+                    .append_batch(std::slice::from_ref(&record))
+                    .map_err(|e| e.to_string())?;
+                {
+                    let mut memtable = self.inner.memtable.write().unwrap();
+                    memtable.insert_delta(record);
+                }
+                self.inner.note_put();
                 let over = self.inner.memtable.read().unwrap().len()
                     >= self.inner.config.memtable_max_records;
                 if over {
@@ -278,7 +299,17 @@ impl MaintenanceActor {
         for meta in &ascending {
             let path = segment_path(hot_dir, cold_dir, meta);
             for record in segment::read_all_records(&path)? {
-                merged.insert(record.key.clone(), record);
+                if record.is_delta() {
+                    // Compaction collapse: fold the increment onto whatever
+                    // this run has for the key (the same merge_delta oracle
+                    // reads use). No base in the run → the fold STAYS
+                    // delta-flagged; its base may live below the run and
+                    // reads keep folding across segments.
+                    let folded = crate::record::merge_delta(merged.get(&record.key), &record);
+                    merged.insert(record.key.clone(), folded);
+                } else {
+                    merged.insert(record.key.clone(), record);
+                }
             }
         }
         // 3. Retention: drop expired records during the rewrite.

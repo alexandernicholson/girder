@@ -3,7 +3,7 @@
 //! its tokens — no two-lock skew, the A1b lesson).
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::record::Record;
+use crate::record::{merge_delta, Record};
 use crate::text::fts_tokens;
 
 /// A memtable: newest-wins records + the token→keys map for `text_match`.
@@ -17,11 +17,30 @@ pub struct MemTable {
     token_keys: HashMap<String, HashSet<String>>,
     /// key → its text's distinct tokens (for overwrite cleanup).
     key_tokens: HashMap<String, Vec<String>>,
+    /// Resident delta-flagged records (their base may be in a segment).
+    delta_keys: usize,
 }
 
 impl MemTable {
+    /// Fold a delta record onto the resident version (if any) and store the
+    /// result — a single serialized-writer step, so concurrent increments can
+    /// never lose an update. When no version is resident the delta is stored
+    /// AS a delta (its base may live in a segment; reads fold across sources).
+    pub fn insert_delta(&mut self, delta: Record) {
+        let merged = merge_delta(self.records.get(&delta.key), &delta);
+        self.insert(merged);
+    }
+
     /// Newest-wins upsert, keeping the token map consistent.
     pub fn insert(&mut self, record: Record) {
+        if let Some(old) = self.records.get(&record.key) {
+            if old.is_delta() {
+                self.delta_keys -= 1;
+            }
+        }
+        if record.is_delta() {
+            self.delta_keys += 1;
+        }
         let key = record.key.clone();
         if let Some(old_tokens) = self.key_tokens.remove(&key) {
             for t in old_tokens {
@@ -65,6 +84,11 @@ impl MemTable {
     /// Key-ascending record iteration (flush encodes straight from this).
     pub fn values(&self) -> impl Iterator<Item = &Record> {
         self.records.values()
+    }
+
+    /// Are any delta-flagged records resident? (Fold-mode scan detection.)
+    pub fn has_deltas(&self) -> bool {
+        self.delta_keys > 0
     }
 
     /// Keys whose text contains ALL of `want` (AND-of-tokens) — the token-map

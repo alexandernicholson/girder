@@ -63,6 +63,10 @@ construction, not by lock choreography:
   intersects postings for exact AND-of-tokens matches (case-insensitive) —
   no post-scan, no payload decode. `QuerySpec::matches` is the naive oracle
   the index provably agrees with (`tests/text_search.rs`).
+- **Counters**: `incr(key, ts, deltas)` — atomic numeric increments through
+  the single writer (concurrent increments never lose an update), folded by
+  one merge oracle across memtable/read/compaction/WAL-replay; ordinary
+  `put` still replaces (LWW). See `docs/GUARANTEES.md` §Counters.
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
 ## Upsert / merge semantics (public guarantee)

@@ -38,6 +38,26 @@ to concurrent `get`/`scan` all at once (the batch is inserted under one
 memtable write lock): a reader never observes a partially applied batch from
 a live engine.
 
+## Counters (`incr`)
+
+`Girder::incr(key, ts, deltas)` adds numeric deltas onto a key atomically:
+increments are serialized through the single writer and folded by ONE merge
+oracle (`merge_delta`) shared by the memtable, every read path, compaction
+and WAL replay — so **concurrent increments never lose an update**
+(`tests/counters.rs`, the concurrent-accrual test). Semantics:
+
+- numerics ADD; identity fields (labels/payload/text) come from the base —
+  a delta only adds numbers (its own fields seed a row it creates);
+- folded `timestamp` = latest activity (max), so an active counter is never
+  aged into retention by an old base;
+- an ordinary `put` still REPLACES the accumulated value — G1 last-write-wins
+  holds unchanged; `incr` is opt-in per write;
+- the returned post-increment snapshot is read after the ack and may include
+  later concurrent increments (monotone counters: never less than this
+  call's own contribution);
+- the `girder.` label prefix is reserved for the engine (the delta flag
+  rides `girder.delta`, stripped from every record the engine returns).
+
 ## Explicit non-guarantees
 
 These are deliberate; do not build on their absence being accidental.

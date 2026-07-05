@@ -161,6 +161,27 @@ ledgered follow-up (D2-adjacent).
 | 10M | Girder | | fts matches ~0.1% (10k matched) | 7.35 s |
 | 10M | Girder | | search box ~0.1% | 7.64 s |
 
+### 10M soak re-run (2026-07-06, on D7 lazy-postings + D8 per-row text compression)
+
+| spans | query | p50 (was 2026-07-05) |
+|---|---|---|
+| 10M | build | **1320.8 s** (was 1043.6 — +27%: per-row deflate at encode + compaction) |
+| 10M | selective ~0.25% (25k matched) | 6.86 s (was 6.59 — ~parity) |
+| 10M | recent ~1% (100k matched) | 1.08 s (was 0.662 — +63%) |
+| 10M | fts matches ~0.1% (10k matched) | 8.61 s (was 7.35 — +17%) |
+| 10M | search box ~0.1% | 8.79 s (was 7.64 — +15%) |
+
+Honest reading: the regressions are D8's read/write costs surfacing on the
+SEAM's materialize-everything path — and the diagnosis found real waste:
+**the rivet seam decodes spans from `Record.payload` and DISCARDS
+`Record.text`**, so every materialized row now pays a per-row inflate for
+bytes it throws away (100k inflates on the `recent` leg ≈ the +0.4 s). Two
+ledgered follow-ups fix it: the already-ledgered seam top-k pushdown
+(materialize 50, not the match set), and a `materialize` variant that
+skips the text column when the caller doesn't verify text (`text_like`
+verification is the only reader). Neither engine-native leg regressed
+(D7/D8 1M tables above); the disk win stands.
+
 The headline pair: at 1M spans the search box through the girder token
 index answers in **441 ms** where the naive in-RAM scan takes **7.97 s** —
 18× — and the engine itself serves the same query in **834 µs** when asked

@@ -245,6 +245,11 @@ impl Girder {
 
     /// Durable write: acks after the WAL append. Triggers freeze+flush when
     /// the memtable is full.
+    ///
+    /// Every write is a per-key last-write-wins **upsert** (by write order,
+    /// not timestamp), and the batch becomes visible atomically in-process —
+    /// the public guarantee documented in `docs/GUARANTEES.md` and pinned by
+    /// `tests/upsert_guarantee.rs`.
     pub async fn put_batch(&self, records: Vec<Record>) -> Result<()> {
         let frozen = self
             .writer

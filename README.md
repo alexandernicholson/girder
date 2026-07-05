@@ -59,6 +59,18 @@ construction, not by lock choreography:
   per-tier segment counts.
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
+## Upsert / merge semantics (public guarantee)
+
+Every `put` is an **upsert**: `Record.key` is the identity, and the last
+*acked* write wins — by write order (WAL-ack order), not by timestamp. The
+winner is stable across memtable, flush, compaction, tiering, close/reopen,
+and crash recovery; a `put_batch` becomes visible atomically in-process.
+Actor-owned single-writer mutation makes this hold by construction, not by
+lock choreography. Normative wording (including the explicit
+**non-guarantees**: no cross-key transactionality, batches are prefix-durable
+under crash) lives in [`docs/GUARANTEES.md`](docs/GUARANTEES.md), pinned by
+`tests/upsert_guarantee.rs`.
+
 ## Numbers (release, laptop, **1M × ~1.3KB records**, columnar v2 engine)
 
 | operation | result |
@@ -113,7 +125,8 @@ let hits = engine.scan(&QuerySpec {
 `cargo test` covers: WAL roundtrip + torn/corrupt tails, segment crc guards,
 zone-map pruning truth table, crash recovery, newest-wins across tiers,
 freeze/flush/cache behavior, compaction dedupe, tiering to cold, retention,
-LRU eviction, and 8-way concurrent writers.
+LRU eviction, and 8-way concurrent writers. `tests/upsert_guarantee.rs` pins
+the documented upsert guarantee (`docs/GUARANTEES.md`) statement by statement.
 
 ## Roadmap
 

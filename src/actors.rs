@@ -196,6 +196,7 @@ impl MaintenanceActor {
                 self.compact()?;
                 self.tier()?;
                 self.groom()?;
+                self.migrate()?;
                 Ok(flushed)
             }
         }
@@ -653,6 +654,72 @@ impl MaintenanceActor {
         Ok(groomed)
     }
 
+    /// Background format migration (docs/COMPAT.md): rewrite at most ONE
+    /// under-versioned segment per tick to the current format — bounded work,
+    /// restart-safe by construction (the rewrite is tmp→fsync→rename + an
+    /// atomic manifest swap; a kill at any point leaves either the old
+    /// segment manifest-listed — retried next tick — or the new one, done).
+    /// This formalizes the previously-opportunistic v1→v2 path: with ticks
+    /// running, every legacy segment converges to current without waiting
+    /// for a compaction to happen to touch it. Reads never depend on
+    /// migration (v1 stays readable forever); this is hygiene, not repair.
+    fn migrate(&self) -> Result<u64> {
+        let candidates: Vec<SegmentMeta> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            let mut metas: Vec<SegmentMeta> = manifest.segments.to_vec();
+            metas.sort_by_key(|m| m.id); // oldest first, deterministic
+            metas
+        };
+        for meta in candidates {
+            let path = segment_path(
+                &self.inner.config.hot_dir,
+                &self.inner.config.cold_dir,
+                &meta,
+            );
+            let version = match segment::file_version(&path) {
+                Ok(v) => v,
+                // A racing compaction/groom may have deleted it — skip;
+                // real corruption resurfaces on the read path.
+                Err(_) => continue,
+            };
+            if version >= segment::CURRENT_SEGMENT_VERSION {
+                continue;
+            }
+            // Rewrite in place: same id (recency slot), same tier, same
+            // created stamp; fresh filename seq (never clobbers).
+            let records = segment::read_all_records(&path)?;
+            let seq = self.alloc_seq();
+            let file = seg_file(seq);
+            let dir = match meta.tier {
+                Tier::Hot => &self.inner.config.hot_dir,
+                Tier::Cold => &self.inner.config.cold_dir,
+            };
+            let out_path = dir.join(&file);
+            let zone = segment::write_segment_presorted(&out_path, &records)?;
+            let bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            {
+                let mut manifest = self.inner.manifest.write().unwrap();
+                manifest.segments.retain(|s| s.id != meta.id);
+                manifest.segments.push(SegmentMeta {
+                    id: meta.id,
+                    file,
+                    tier: meta.tier,
+                    zone,
+                    bytes,
+                    created_unix_nanos: meta.created_unix_nanos,
+                });
+                self.inner.store_manifest(&manifest)?;
+            }
+            std::fs::remove_file(&path).ok();
+            self.inner.cache.invalidate(meta.cache_key());
+            self.inner
+                .stats_migrated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(1); // one per tick: bounded background work
+        }
+        Ok(0)
+    }
+
     /// Move hot segments past `hot_ttl` to the cold tier.
     fn tier(&self) -> Result<u64> {
         let cutoff = now_nanos() - self.inner.config.hot_ttl_nanos;
@@ -774,4 +841,170 @@ fn longest_tier_run<'a>(
         i = j.max(i + 1);
     }
     best.map(|(s, l)| window[s..s + l].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use crate::record::Record;
+    use crate::segment::ZoneMap;
+    use crate::{FsyncPolicy, Girder, GirderConfig, QuerySpec};
+    use std::time::Duration;
+
+    fn rec(key: &str, ts: i64) -> Record {
+        Record {
+            key: key.to_string(),
+            timestamp: ts,
+            labels: BTreeMap::from([("model".to_string(), "m".to_string())]),
+            numerics: BTreeMap::from([("latency_ms".to_string(), ts as f64)]),
+            payload: format!("p-{key}").into_bytes(),
+            text: None,
+        }
+    }
+
+    /// A legacy v1 segment: `[magic][ver=1][crc][rmp(Vec<Record>)]`. The
+    /// magic literal pins the on-disk constant (segment.rs `MAGIC`).
+    fn write_v1_segment(path: &std::path::Path, records: &[Record]) {
+        let body = rmp_serde::to_vec(&records.to_vec()).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x6769_7264u32.to_le_bytes()); // "gird"
+        out.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+        out.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        out.extend_from_slice(&body);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Fabricate a COMPLETE pre-B3 store: three v1 segments listed by a v0
+    /// (magic-less, bare-rmp) manifest — then prove the background migration
+    /// converges to the current format across restarts, tolerates the exact
+    /// on-disk state a kill-mid-rewrite leaves (a written output file NOT yet
+    /// manifest-listed: an orphan, ignored — the manifest is truth), and
+    /// never changes what reads return.
+    ///
+    /// The kill state is enacted BY CONSTRUCTION, not by racing a dropped
+    /// engine's background actors against a reopened one (two live engines
+    /// on one dir have two in-memory manifests — that is not a kill, it is
+    /// corruption by test bug). Per the B2 lesson, the open-time tick can
+    /// fire at any point: all assertions are monotone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_converges_and_survives_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path();
+
+        let mut all: Vec<Record> = Vec::new();
+        let mut manifest = Manifest {
+            next_segment_id: 10,
+            segments: Vec::new(),
+        };
+        for seg in 0..3u64 {
+            let records: Vec<Record> = (0..20)
+                .map(|i| rec(&format!("s/{seg}/{i:03}"), (seg * 100 + i) as i64))
+                .collect();
+            let file = format!("seg-{seg:016}.gird");
+            write_v1_segment(&hot.join(&file), &records);
+            manifest.segments.push(SegmentMeta {
+                id: seg,
+                file,
+                tier: Tier::Hot,
+                zone: ZoneMap::build(&records),
+                bytes: 0,
+                created_unix_nanos: 1,
+            });
+            all.extend(records);
+        }
+        // v0 manifest: bare rmp, no magic word.
+        std::fs::write(hot.join("MANIFEST"), rmp_serde::to_vec(&manifest).unwrap()).unwrap();
+        // The kill-mid-rewrite residue: a stray output file a crash between
+        // write and manifest-swap would leave. Not manifest-listed = garbage.
+        write_v1_segment(&hot.join("seg-0000000000000099.gird"), &all[0..2]);
+
+        let mut cfg = GirderConfig::at(hot);
+        cfg.fsync = FsyncPolicy::EveryN(64);
+        cfg.compact_min_segments = 100; // migration only, no compaction
+        cfg.hot_ttl_nanos = i64::MAX / 2; // no tiering
+        cfg.tick_interval = Duration::from_secs(3600);
+
+        let expected_keys = {
+            let mut k: Vec<String> = all.iter().map(|r| r.key.clone()).collect();
+            k.sort();
+            k
+        };
+        let scan_keys = |records: Vec<Record>| {
+            let mut k: Vec<String> = records.into_iter().map(|r| r.key).collect();
+            k.sort();
+            k
+        };
+        // Versions of the MANIFEST-LISTED segments (orphans are garbage and
+        // deliberately not counted).
+        let listed_versions = |hot: &std::path::Path| -> Vec<u32> {
+            let manifest = Manifest::load(&hot.join("MANIFEST")).unwrap();
+            let mut v: Vec<u32> = manifest
+                .segments
+                .iter()
+                .map(|m| crate::segment::file_version(&hot.join(&m.file)).unwrap())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Phase 1: open the legacy store (v0 manifest + orphan present),
+        // verify reads, migrate at least one segment, quiesce, stop.
+        {
+            let engine = Girder::open(cfg.clone()).await.unwrap();
+            assert_eq!(
+                scan_keys(engine.scan(&QuerySpec::default()).await.unwrap()),
+                expected_keys,
+                "v1 store readable before any migration; orphan ignored"
+            );
+            engine.maintain().await.unwrap(); // >= 1 migrated (open-tick may add)
+            assert_eq!(
+                scan_keys(engine.scan(&QuerySpec::default()).await.unwrap()),
+                expected_keys,
+                "reads unchanged mid-migration"
+            );
+            engine.close().await.unwrap();
+        }
+        let mid = listed_versions(hot);
+        assert!(mid.contains(&2), "progress before restart: {mid:?}");
+        assert_eq!(mid.len(), 3, "no segment lost: {mid:?}");
+
+        // Phase 2: restart mid-migration (mixed v1+v2 manifest, now in the
+        // current manifest format); ticks converge the rest.
+        {
+            let engine = Girder::open(cfg.clone()).await.unwrap();
+            assert_eq!(
+                scan_keys(engine.scan(&QuerySpec::default()).await.unwrap()),
+                expected_keys,
+                "mixed-version store readable after restart"
+            );
+            for _ in 0..4 {
+                engine.maintain().await.unwrap();
+            }
+            assert_eq!(engine.stats().compactions, 0, "migration, not compaction");
+            assert_eq!(
+                scan_keys(engine.scan(&QuerySpec::default()).await.unwrap()),
+                expected_keys,
+                "reads unchanged after full migration"
+            );
+            let got = engine.get("s/1/005").await.unwrap().unwrap();
+            assert_eq!(got.payload, b"p-s/1/005");
+            engine.close().await.unwrap();
+        }
+        assert_eq!(
+            listed_versions(hot),
+            vec![2, 2, 2],
+            "every listed segment converged to the current format"
+        );
+
+        // Phase 3: a fresh open finds nothing left to migrate (idempotent).
+        let engine = Girder::open(cfg).await.unwrap();
+        engine.maintain().await.unwrap();
+        assert_eq!(engine.stats().migrated_segments, 0, "nothing left to do");
+        assert_eq!(
+            scan_keys(engine.scan(&QuerySpec::default()).await.unwrap()),
+            expected_keys
+        );
+        engine.close().await.unwrap();
+    }
 }

@@ -72,6 +72,11 @@ construction, not by lock choreography:
   the single writer (concurrent increments never lose an update), folded by
   one merge oracle across memtable/read/compaction/WAL-replay; ordinary
   `put` still replaces (LWW). See `docs/GUARANTEES.md` §Counters.
+- **Versioned formats + background migration**: segments, manifest and WAL
+  all carry version words (absent = v0, readable forever; unknown future
+  versions fail closed); legacy segments are rewritten to the current
+  format one-per-tick, restart-safe by construction. `docs/COMPAT.md` has
+  the full matrix.
 - **Graceful shutdown**: `close()` checkpoints everything to segments.
 
 ## Upsert / merge semantics (public guarantee)

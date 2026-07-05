@@ -68,6 +68,9 @@ const DICT_MAX: usize = u16::MAX as usize;
 const BLOCK_BITSET_CODES: u16 = 64;
 
 // Section kind tags.
+/// The format every new segment is written in (see docs/COMPAT.md).
+pub const CURRENT_SEGMENT_VERSION: u32 = VERSION_V2;
+
 const K_KEYS: u8 = 0;
 const K_TS: u8 = 1;
 const K_LABEL: u8 = 2;
@@ -1833,6 +1836,13 @@ pub fn read_header(file: &File, bytes_read: &AtomicU64) -> Result<u32> {
 /// Parse a v2 segment's footer directory with two small positioned reads (the
 /// 16-byte trailer, then the crc-verified directory body). No column bytes are
 /// read here.
+/// The on-disk format version of a segment file (cheap 8-byte header read).
+pub fn file_version(path: &Path) -> Result<u32> {
+    let file = File::open(path)?;
+    let ignored = AtomicU64::new(0);
+    read_header(&file, &ignored)
+}
+
 pub fn read_footer(file: &File, bytes_read: &AtomicU64) -> Result<SegDir> {
     let len = file.metadata()?.len();
     if len < 24 {

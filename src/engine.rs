@@ -93,6 +93,7 @@ pub struct EngineInner {
     pub stats_flushes: AtomicU64,
     pub stats_compactions: AtomicU64,
     pub stats_groomed: AtomicU64,
+    pub stats_migrated: AtomicU64,
     pub stats_tiered: AtomicU64,
     /// Total bytes written by flushes (denominator for write amplification).
     pub stats_bytes_flushed: AtomicU64,
@@ -132,6 +133,8 @@ pub struct Stats {
     pub compactions: u64,
     /// Segments removed or rewritten by the retention groomer.
     pub groomed_segments: u64,
+    /// Legacy-format segments rewritten to the current format.
+    pub migrated_segments: u64,
     pub tiered: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -205,6 +208,7 @@ impl Girder {
             stats_flushes: AtomicU64::new(0),
             stats_compactions: AtomicU64::new(0),
             stats_groomed: AtomicU64::new(0),
+            stats_migrated: AtomicU64::new(0),
             stats_tiered: AtomicU64::new(0),
             stats_bytes_flushed: AtomicU64::new(0),
             stats_bytes_compacted: AtomicU64::new(0),
@@ -1162,6 +1166,7 @@ impl Girder {
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),
             compactions: self.inner.stats_compactions.load(Ordering::Relaxed),
             groomed_segments: self.inner.stats_groomed.load(Ordering::Relaxed),
+            migrated_segments: self.inner.stats_migrated.load(Ordering::Relaxed),
             tiered: self.inner.stats_tiered.load(Ordering::Relaxed),
             cache_hits: self.inner.stats_cache_hits.load(Ordering::Relaxed),
             cache_misses: self.inner.stats_cache_misses.load(Ordering::Relaxed),

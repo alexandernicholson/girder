@@ -1,5 +1,10 @@
 //! The manifest: the authoritative list of live segments, updated atomically
 //! (write temp + fsync + rename). Everything not in the manifest is garbage.
+//!
+//! **Versioning (docs/COMPAT.md).** Files written since B3 begin with
+//! `[u32 "GMAN"][u32 version]` followed by the rmp body; a file with no
+//! magic is v0 (bare rmp) and stays readable forever. Every store() writes
+//! the current version. An unknown future version fails CLOSED.
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -49,20 +54,44 @@ pub struct Manifest {
     pub segments: Vec<SegmentMeta>,
 }
 
+const MANIFEST_MAGIC: u32 = 0x4e41_4d47; // "GMAN"
+const MANIFEST_VERSION: u32 = 1;
+
 impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest> {
-        match std::fs::read(path) {
-            Ok(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| GirderError::Corrupt {
-                what: "manifest",
-                detail: e.to_string(),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
-            Err(e) => Err(e.into()),
-        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Manifest::default()),
+            Err(e) => return Err(e.into()),
+        };
+        let body = if bytes.len() >= 8
+            && u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == MANIFEST_MAGIC
+        {
+            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            if version > MANIFEST_VERSION {
+                // Fail CLOSED — reading a future manifest as anything else
+                // could orphan live segments.
+                return Err(GirderError::Corrupt {
+                    what: "manifest",
+                    detail: format!("unsupported manifest version {version}"),
+                });
+            }
+            &bytes[8..]
+        } else {
+            &bytes[..] // v0: bare rmp, readable forever
+        };
+        rmp_serde::from_slice(body).map_err(|e| GirderError::Corrupt {
+            what: "manifest",
+            detail: e.to_string(),
+        })
     }
 
     pub fn store(&self, path: &Path) -> Result<()> {
-        let bytes = rmp_serde::to_vec(self).map_err(|e| GirderError::Encode(e.to_string()))?;
+        let body = rmp_serde::to_vec(self).map_err(|e| GirderError::Encode(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(8 + body.len());
+        bytes.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&body);
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &bytes)?;
         let file = std::fs::File::open(&tmp)?;
@@ -78,5 +107,49 @@ pub fn segment_path(hot_dir: &Path, cold_dir: &Path, meta: &SegmentMeta) -> Path
     match meta.tier {
         Tier::Hot => hot_dir.join(&meta.file),
         Tier::Cold => cold_dir.join(&meta.file),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0 (bare-rmp, magic-less) manifests read forever; store() writes the
+    /// current versioned format; a future version fails CLOSED.
+    #[test]
+    fn manifest_version_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let manifest = Manifest {
+            next_segment_id: 7,
+            segments: Vec::new(),
+        };
+
+        // v0 on disk → loads.
+        std::fs::write(&path, rmp_serde::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(Manifest::load(&path).unwrap().next_segment_id, 7);
+
+        // store() → versioned; round-trips; header present.
+        manifest.store(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], &MANIFEST_MAGIC.to_le_bytes());
+        assert_eq!(Manifest::load(&path).unwrap().next_segment_id, 7);
+
+        // Future version → hard error (never misread as v0).
+        let mut future = Vec::new();
+        future.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+        future.extend_from_slice(&9u32.to_le_bytes());
+        future.extend_from_slice(&rmp_serde::to_vec(&manifest).unwrap());
+        std::fs::write(&path, future).unwrap();
+        assert!(Manifest::load(&path).is_err());
+
+        // Absent file → empty default (unchanged behavior).
+        assert_eq!(
+            Manifest::load(&dir.path().join("nope"))
+                .unwrap()
+                .segments
+                .len(),
+            0
+        );
     }
 }

@@ -3,6 +3,14 @@
 //! Format per frame: `[u32 len][u32 crc32(body)][body: rmp(Record)]`.
 //! Replay stops at the first torn/corrupt frame (crash tail), which is the
 //! correct recovery semantic for an append-only log.
+//!
+//! **Versioning (docs/COMPAT.md).** Files created since B3 begin with an
+//! 8-byte header `[u32 "GWAL"][u32 version]`; a file with no header is v0
+//! and stays readable forever. The magic decodes as a >1 GB frame length
+//! under v0 rules (far past the 64 MB cap), so a pre-B3 binary reading a
+//! headered file stops cleanly instead of misparsing. An unknown version
+//! fails CLOSED (error, not silent-empty — silently dropping acked frames
+//! on a downgrade would be data loss dressed as recovery).
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
@@ -28,9 +36,23 @@ pub struct Wal {
     pub appended: u64,
 }
 
+/// New WAL files start with `[WAL_MAGIC][WAL_VERSION]`.
+const WAL_MAGIC: u32 = 0x4c41_5747; // "GWAL"
+const WAL_VERSION: u32 = 1;
+
 impl Wal {
     pub fn open(path: &Path, policy: FsyncPolicy) -> Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Stamp the version header on a brand-new (empty) file. Appending to
+        // an existing headerless (v0) file keeps it v0 — the version is a
+        // whole-file property. A header torn by a crash before any frame is
+        // an empty log (correct: nothing was acked).
+        if file.metadata()?.len() == 0 {
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+            header[4..8].copy_from_slice(&WAL_VERSION.to_le_bytes());
+            file.write_all(&header)?;
+        }
         Ok(Wal {
             file,
             policy,
@@ -78,11 +100,30 @@ impl Wal {
         };
         let mut reader = BufReader::new(file);
         let mut records = Vec::new();
+        let mut first = true;
         loop {
             let mut header = [0u8; 8];
             match reader.read_exact(&mut header) {
                 Ok(()) => {}
-                Err(_) => break, // clean EOF or torn header
+                Err(_) => break, // clean EOF or torn header (incl. torn version header)
+            }
+            if first {
+                first = false;
+                let word = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                if word == WAL_MAGIC {
+                    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                    if version > WAL_VERSION {
+                        // Fail CLOSED: an unknown future format must not read
+                        // as an empty log (that would drop acked writes).
+                        return Err(GirderError::Corrupt {
+                            what: "wal",
+                            detail: format!("unsupported wal version {version}"),
+                        });
+                    }
+                    continue; // header consumed; frames follow
+                }
+                // No magic: a v0 (headerless) file — these 8 bytes are the
+                // first frame header. Fall through.
             }
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
@@ -162,5 +203,63 @@ mod tests {
         }
         let replayed = Wal::replay(&path).unwrap();
         assert_eq!(replayed.len(), 1);
+    }
+
+    fn rec(key: &str) -> Record {
+        Record {
+            key: key.to_string(),
+            timestamp: 1,
+            labels: Default::default(),
+            numerics: Default::default(),
+            payload: b"p".to_vec(),
+            text: None,
+        }
+    }
+
+    /// New files are headered and round-trip; a headerless (v0) file replays
+    /// forever; an unknown future version fails CLOSED (never empty-read).
+    #[test]
+    fn wal_version_header_compat() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // New file: header stamped, frames replay.
+        let path = dir.path().join("new.log");
+        let mut wal = Wal::open(&path, FsyncPolicy::Always).unwrap();
+        wal.append_batch(&[rec("a"), rec("b")]).unwrap();
+        drop(wal);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], &WAL_MAGIC.to_le_bytes(), "header stamped");
+        let got = Wal::replay(&path).unwrap();
+        assert_eq!(got.len(), 2);
+
+        // v0 file: frames from byte 0, no header — replays forever.
+        let path = dir.path().join("v0.log");
+        let body = rmp_serde::to_vec(&rec("legacy")).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        out.extend_from_slice(&body);
+        std::fs::write(&path, out).unwrap();
+        let got = Wal::replay(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "legacy");
+        // Appending to a v0 file keeps it v0 (whole-file property).
+        let mut wal = Wal::open(&path, FsyncPolicy::Always).unwrap();
+        wal.append_batch(&[rec("more")]).unwrap();
+        drop(wal);
+        assert_eq!(Wal::replay(&path).unwrap().len(), 2);
+
+        // Future version: hard error, not a silently-empty log.
+        let path = dir.path().join("future.log");
+        let mut out = Vec::new();
+        out.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        out.extend_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, out).unwrap();
+        assert!(Wal::replay(&path).is_err(), "future format fails closed");
+
+        // Torn header (crash during creation): an empty log, not an error.
+        let path = dir.path().join("torn.log");
+        std::fs::write(&path, &WAL_MAGIC.to_le_bytes()[0..3]).unwrap();
+        assert!(Wal::replay(&path).unwrap().is_empty());
     }
 }

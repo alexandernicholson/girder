@@ -29,6 +29,7 @@ fn record(i: usize) -> Record {
         ]),
         numerics: BTreeMap::from([("latency_ms".to_string(), (i % 2000) as f64)]),
         payload: vec![7u8; 1200], // ~realistic span JSON size
+        text: None,
     }
 }
 

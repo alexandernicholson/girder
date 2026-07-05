@@ -15,6 +15,7 @@ fn record(key: &str, ts: i64, model: &str, latency: f64) -> Record {
         ]),
         numerics: BTreeMap::from([("latency_ms".to_string(), latency)]),
         payload: format!("payload-{key}").into_bytes(),
+        text: None,
     }
 }
 
@@ -335,6 +336,7 @@ async fn column_scan_matches_naive_oracle() {
             labels,
             numerics,
             payload: format!("pl-{key}-{ts}").into_bytes(),
+            text: None,
         };
         oracle.insert(key, rec.clone());
         engine.put(rec).await.unwrap();
@@ -483,6 +485,7 @@ async fn topk_matches_naive_oracle() {
             labels,
             numerics,
             payload: format!("pl-{key}-{this_ts}").into_bytes(),
+            text: None,
         };
         truth.insert(key, rec.clone());
         engine.put(rec).await.unwrap();
@@ -757,6 +760,7 @@ async fn tiered_compaction_preserves_newest_wins_and_no_loss() {
             labels,
             numerics,
             payload: format!("pl-{key}-{ts}").into_bytes(),
+            text: None,
         };
         oracle.insert(key, rec.clone());
         engine.put(rec).await.unwrap();
@@ -969,6 +973,7 @@ fn big_record(i: usize, payload_len: usize) -> Record {
         ]),
         numerics: BTreeMap::from([("latency_ms".to_string(), (i % 2000) as f64)]),
         payload: vec![7u8; payload_len],
+        text: None,
     }
 }
 
@@ -1253,5 +1258,117 @@ async fn reads_survive_concurrent_compaction() {
     assert!(
         stats.compactions >= 10,
         "compaction actually raced: {stats:?}"
+    );
+}
+
+/// `Record.text` (the FTS document) round-trips through every lifecycle
+/// stage: memtable, flush (K_TEXT column), compaction rewrite, crash
+/// recovery (WAL), close/reopen — and `None` / `Some("")` stay distinct
+/// (absent ≠ empty). A segment whose records carry no text writes NO text
+/// section (pinned in segment.rs unit tests; here: reads stay correct).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_roundtrips_through_all_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Girder::open(config(dir.path())).await.unwrap();
+    let with_text = |key: &str, ts: i64, text: Option<&str>| {
+        let mut r = record(key, ts, "gpt-4o", 1.0);
+        r.text = text.map(String::from);
+        r
+    };
+
+    engine
+        .put_batch(vec![
+            with_text("k/text", 1, Some("Hello, World! timeout after 30s")),
+            with_text("k/empty", 2, Some("")),
+            with_text("k/none", 3, None),
+            with_text("k/uni", 4, Some("Ünïcode Café naïve")),
+        ])
+        .await
+        .unwrap();
+
+    let check = |records: Vec<Record>, stage: &str| {
+        let get = |k: &str| {
+            records
+                .iter()
+                .find(|r| r.key == k)
+                .unwrap_or_else(|| panic!("{k} missing at {stage}"))
+                .text
+                .clone()
+        };
+        assert_eq!(
+            get("k/text"),
+            Some("Hello, World! timeout after 30s".to_string()),
+            "{stage}"
+        );
+        assert_eq!(
+            get("k/empty"),
+            Some(String::new()),
+            "{stage}: empty ≠ absent"
+        );
+        assert_eq!(get("k/none"), None, "{stage}: absent stays absent");
+        assert_eq!(
+            get("k/uni"),
+            Some("Ünïcode Café naïve".to_string()),
+            "{stage}"
+        );
+    };
+
+    // Memtable.
+    check(
+        engine.scan(&QuerySpec::default()).await.unwrap(),
+        "memtable",
+    );
+    // Segment (K_TEXT column, per-row sliced).
+    engine.flush().await.unwrap();
+    check(engine.scan(&QuerySpec::default()).await.unwrap(), "segment");
+    // Point get from segment.
+    assert_eq!(
+        engine.get("k/uni").await.unwrap().unwrap().text.as_deref(),
+        Some("Ünïcode Café naïve")
+    );
+    // Compaction rewrite (config compact_min_segments = 3; runs must be
+    // size-tier-compatible, so make two more 4-record segments to match the
+    // first — the text-carrying segment itself is rewritten).
+    for round in 0..2 {
+        engine
+            .put_batch(
+                (0..4)
+                    .map(|i| with_text(&format!("k/fill{round}{i}"), 10 + round * 4 + i, None))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+    }
+    engine.maintain().await.unwrap();
+    assert!(engine.stats().compactions >= 1);
+    check(
+        engine.scan(&QuerySpec::default()).await.unwrap(),
+        "post-compaction",
+    );
+
+    // Crash recovery: text-carrying WAL frames replay.
+    engine
+        .put(with_text("k/wal", 7, Some("only in the wal")))
+        .await
+        .unwrap();
+    drop(engine);
+    let engine = Girder::open(config(dir.path())).await.unwrap();
+    assert_eq!(
+        engine.get("k/wal").await.unwrap().unwrap().text.as_deref(),
+        Some("only in the wal"),
+        "crash recovery"
+    );
+    check(
+        engine.scan(&QuerySpec::default()).await.unwrap(),
+        "post-recovery",
+    );
+
+    // Close/reopen checkpoint.
+    engine.close().await.unwrap();
+    let engine = Girder::open(config(dir.path())).await.unwrap();
+    check(
+        engine.scan(&QuerySpec::default()).await.unwrap(),
+        "post-close-reopen",
     );
 }

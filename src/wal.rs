@@ -121,6 +121,7 @@ mod tests {
             labels: Default::default(),
             numerics: Default::default(),
             payload: vec![1, 2, 3],
+            text: None,
         }
     }
 

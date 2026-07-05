@@ -15,6 +15,7 @@ fn record(key: &str, ts: i64, version: &str) -> Record {
         labels: BTreeMap::from([("version".to_string(), version.to_string())]),
         numerics: BTreeMap::new(),
         payload: format!("payload-{version}").into_bytes(),
+        text: None,
     }
 }
 

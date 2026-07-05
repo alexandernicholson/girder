@@ -16,7 +16,7 @@ use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier};
 use crate::record::{OrderBy, QuerySpec, Record};
 use crate::segment::{
     self, BlockMeta, KeysSection, LabelColumn, NumericColumn, PayloadIndex, Section, SectionId,
-    SegDir, SegmentColumns,
+    SegDir, SegmentColumns, TextIndex,
 };
 use crate::wal::{FsyncPolicy, Wal};
 
@@ -647,6 +647,7 @@ impl Girder {
         let timestamps = self.section_timestamps(id, &dir, &file, &mut disk)?;
         let blocks = self.section_blocks(id, &dir, &file, &mut disk)?;
         let payload_index = self.section_payload_index(id, &dir, &file, &mut disk)?;
+        let text_index = self.section_text_index(id, &dir, &file, &mut disk)?;
         let mut labels = BTreeMap::new();
         for name in dir.label_names() {
             let col = self.section_label(id, &dir, &file, &name, &mut disk)?;
@@ -671,6 +672,7 @@ impl Girder {
             numerics,
             blocks,
             payload_index,
+            text_index,
         ));
         Ok((cols, Some(file)))
     }
@@ -770,6 +772,31 @@ impl Girder {
             Section::PayloadIndex(Arc::clone(&p)),
         );
         Ok(p)
+    }
+
+    /// Text offset table, or `None` when the segment has no text section.
+    /// The absence itself is worth caching — a cache miss on every scan of a
+    /// text-less segment would defeat the warm path — but a `None` payload
+    /// can't live in the section cache, so absence is re-derived from the
+    /// (cached) directory each time: `load_text_index` returns without I/O
+    /// when the dir has no entry.
+    fn section_text_index(
+        &self,
+        id: u64,
+        dir: &SegDir,
+        file: &std::fs::File,
+        disk: &mut bool,
+    ) -> Result<Option<Arc<TextIndex>>> {
+        if let Some(Section::TextIndex(t)) = self.inner.cache.get(id, SectionId::TextIndex) {
+            return Ok(Some(t));
+        }
+        let Some(t) = segment::load_text_index(file, dir, &self.inner.stats_bytes_read)? else {
+            return Ok(None);
+        };
+        *disk = true;
+        let t = Arc::new(t);
+        self.cache_put(id, SectionId::TextIndex, Section::TextIndex(Arc::clone(&t)));
+        Ok(Some(t))
     }
 
     fn section_label(

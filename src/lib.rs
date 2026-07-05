@@ -40,9 +40,11 @@ mod error;
 mod manifest;
 mod record;
 mod segment;
+pub mod text;
 mod wal;
 
 pub use engine::{Girder, GirderConfig, Stats};
 pub use error::{GirderError, Result};
 pub use record::{OrderBy, QuerySpec, Record};
+pub use text::fts_tokens;
 pub use wal::FsyncPolicy;

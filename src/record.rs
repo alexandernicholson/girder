@@ -19,6 +19,16 @@ pub struct Record {
     /// Opaque document (e.g. serialized span JSON).
     #[serde(with = "serde_bytes_vec", default)]
     pub payload: Vec<u8>,
+    /// Caller-supplied searchable text (the FTS document for this record —
+    /// e.g. extracted message content). The engine tokenizes it per
+    /// [`crate::text::fts_tokens`] into the segment token index; the payload
+    /// stays opaque. `None` = not searchable (absent ≠ empty string).
+    ///
+    /// Serde: `skip_serializing_if` keeps text-less records byte-identical
+    /// to the pre-text wire format, and `default` keeps every pre-text WAL
+    /// frame / v1 segment readable (pinned by `text_field_wire_compat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Compact byte-array encoding for msgpack (avoids per-element ints).
@@ -118,5 +128,73 @@ impl QuerySpec {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact pre-text `Record` wire shape (what every WAL frame and v1
+    /// segment written before the text field contained).
+    #[derive(Serialize)]
+    struct RecordV0<'a> {
+        key: &'a str,
+        timestamp: i64,
+        labels: &'a BTreeMap<String, String>,
+        numerics: &'a BTreeMap<String, f64>,
+        #[serde(with = "ser_bytes")]
+        payload: &'a [u8],
+    }
+    mod ser_bytes {
+        use serde::Serializer;
+        pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(v)
+        }
+    }
+
+    /// Wire compat, both directions (pins the `Record.text` serde contract):
+    /// pre-text bytes decode with `text: None`, and a text-less record
+    /// serializes byte-identical to the pre-text format — so introducing the
+    /// field changed NOTHING on disk until a caller actually supplies text.
+    #[test]
+    fn text_field_wire_compat() {
+        let labels = BTreeMap::from([("model".to_string(), "gpt-4o".to_string())]);
+        let numerics = BTreeMap::from([("latency_ms".to_string(), 42.0)]);
+        let old_bytes = rmp_serde::to_vec(&RecordV0 {
+            key: "k1",
+            timestamp: 123,
+            labels: &labels,
+            numerics: &numerics,
+            payload: b"span-json",
+        })
+        .unwrap();
+
+        // Old bytes → new struct: text defaults to None.
+        let decoded: Record = rmp_serde::from_slice(&old_bytes).unwrap();
+        assert_eq!(decoded.text, None);
+        assert_eq!(decoded.key, "k1");
+        assert_eq!(decoded.payload, b"span-json");
+
+        // New struct without text → byte-identical to the old format.
+        let new_bytes = rmp_serde::to_vec(&decoded).unwrap();
+        assert_eq!(
+            new_bytes, old_bytes,
+            "text-less record must not change the wire format"
+        );
+
+        // With text → longer form that round-trips.
+        let mut with_text = decoded.clone();
+        with_text.text = Some("hello world".into());
+        let bytes = rmp_serde::to_vec(&with_text).unwrap();
+        assert_ne!(bytes, old_bytes);
+        let back: Record = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back, with_text);
+
+        // Empty-string text is preserved as Some("") — absent ≠ empty.
+        let mut empty_text = decoded.clone();
+        empty_text.text = Some(String::new());
+        let back: Record = rmp_serde::from_slice(&rmp_serde::to_vec(&empty_text).unwrap()).unwrap();
+        assert_eq!(back.text, Some(String::new()));
     }
 }

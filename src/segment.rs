@@ -74,6 +74,11 @@ const K_LABEL: u8 = 2;
 const K_NUMERIC: u8 = 3;
 const K_PAYLOAD: u8 = 4;
 const K_BLOCKS: u8 = 5;
+/// Searchable text column (`Record.text`): presence bitmap + offset table +
+/// utf8 blob, sliced per row at materialize time like the payload. Emitted
+/// only when at least one record carries text, so text-less segments stay
+/// byte-identical to the pre-text format.
+const K_TEXT: u8 = 6;
 
 fn corrupt(detail: impl Into<String>) -> GirderError {
     GirderError::Corrupt {
@@ -259,6 +264,32 @@ impl PayloadIndex {
     }
 }
 
+/// The text offset table (K_TEXT): which rows have text, and where each
+/// row's utf8 slice lives in the file. Blob bytes are `read_exact_at` per
+/// surviving row, mirroring [`PayloadIndex`] — a scan that never
+/// materializes a row never reads its text.
+pub struct TextIndex {
+    abs_base: u64,
+    present: Vec<bool>,
+    rel: Vec<u64>,
+}
+
+impl TextIndex {
+    fn bytes(&self) -> u64 {
+        self.present.len() as u64 + (self.rel.len() as u64) * 8 + 32
+    }
+}
+
+/// How row texts are sourced when materializing a `Record`. `None` on the
+/// containing [`SegmentColumns`] means the segment carries no text at all
+/// (pre-text file, or no record had text) — honest absence, not empty.
+enum Texts {
+    /// v2: slice `rel[i]..rel[i+1]` at `abs_base` when `present[i]`.
+    File(Arc<TextIndex>),
+    /// v1 compat / in-memory columns.
+    Mem(Arc<Vec<Option<String>>>),
+}
+
 /// How row payloads are sourced when materializing a `Record`.
 enum Payloads {
     /// v2: raw bytes live in the file; slice `rel[i]..rel[i+1]` at `abs_base`.
@@ -279,6 +310,7 @@ pub struct SegmentColumns {
     numerics: BTreeMap<String, Arc<NumericColumn>>,
     blocks: Arc<Vec<BlockMeta>>,
     payloads: Payloads,
+    texts: Option<Texts>,
 }
 
 impl SegmentColumns {
@@ -480,10 +512,25 @@ impl SegmentColumns {
                 read_at(f, off, len, bytes_read)?
             }
         };
-        Ok(self.build_record(i, payload))
+        let text = match &self.texts {
+            None => None,
+            Some(Texts::Mem(v)) => v[i].clone(),
+            Some(Texts::File(ti)) => {
+                if ti.present[i] {
+                    let f = file.ok_or_else(|| corrupt("text file handle missing"))?;
+                    let off = ti.abs_base + ti.rel[i];
+                    let len = (ti.rel[i + 1] - ti.rel[i]) as usize;
+                    let bytes = read_at(f, off, len, bytes_read)?;
+                    Some(String::from_utf8(bytes).map_err(|_| corrupt("text not utf8"))?)
+                } else {
+                    None
+                }
+            }
+        };
+        Ok(self.build_record(i, payload, text))
     }
 
-    fn build_record(&self, i: usize, payload: Vec<u8>) -> Record {
+    fn build_record(&self, i: usize, payload: Vec<u8>, text: Option<String>) -> Record {
         let mut labels = BTreeMap::new();
         for (name, col) in &self.labels {
             match col.as_ref() {
@@ -512,6 +559,7 @@ impl SegmentColumns {
             labels,
             numerics,
             payload,
+            text,
         }
     }
 
@@ -568,7 +616,18 @@ impl SegmentColumns {
         }
 
         let blocks = build_blocks(&records, &plans);
-        let payloads = Payloads::Mem(Arc::new(records.into_iter().map(|r| r.payload).collect()));
+        let any_text = records.iter().any(|r| r.text.is_some());
+        let mut texts_vec: Vec<Option<String>> = Vec::with_capacity(count);
+        let payloads = Payloads::Mem(Arc::new(
+            records
+                .into_iter()
+                .map(|mut r| {
+                    texts_vec.push(r.text.take());
+                    r.payload
+                })
+                .collect(),
+        ));
+        let texts = any_text.then(|| Texts::Mem(Arc::new(texts_vec)));
         SegmentColumns {
             count,
             keys: Arc::new(KeysSection { blob, offsets }),
@@ -577,6 +636,7 @@ impl SegmentColumns {
             numerics,
             blocks: Arc::new(blocks),
             payloads,
+            texts,
         }
     }
 
@@ -591,6 +651,7 @@ impl SegmentColumns {
         numerics: BTreeMap<String, Arc<NumericColumn>>,
         blocks: Arc<Vec<BlockMeta>>,
         payload_index: Arc<PayloadIndex>,
+        text_index: Option<Arc<TextIndex>>,
     ) -> SegmentColumns {
         SegmentColumns {
             count,
@@ -600,6 +661,7 @@ impl SegmentColumns {
             numerics,
             blocks,
             payloads: Payloads::File(payload_index),
+            texts: text_index.map(Texts::File),
         }
     }
 }
@@ -654,6 +716,8 @@ pub enum SectionId {
     PayloadIndex,
     Label(String),
     Numeric(String),
+    /// The text offset table (K_TEXT header; blob bytes are never cached).
+    TextIndex,
     /// A whole v1 (legacy) segment decoded in memory — v1 is not
     /// section-structured, so it is cached as one entry.
     V1Whole,
@@ -670,6 +734,7 @@ pub enum Section {
     PayloadIndex(Arc<PayloadIndex>),
     Label(Arc<LabelColumn>),
     Numeric(Arc<NumericColumn>),
+    TextIndex(Arc<TextIndex>),
     V1Whole(Arc<SegmentColumns>),
 }
 
@@ -685,6 +750,7 @@ impl Section {
             Section::PayloadIndex(p) => p.bytes(),
             Section::Label(l) => label_bytes(l),
             Section::Numeric(n) => numeric_bytes(n),
+            Section::TextIndex(t) => t.bytes(),
             Section::V1Whole(c) => c.heap_bytes(),
         }
     }
@@ -931,6 +997,39 @@ fn encode_payloads<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
     body
 }
 
+/// Encode the K_TEXT section: presence bitmap + zero-based offset table
+/// (count+1 entries over ALL rows; absent rows contribute zero length) +
+/// concatenated utf8 blob of present texts.
+fn encode_texts<R: Borrow<Record>>(records: &[R]) -> Vec<u8> {
+    let count = records.len();
+    let mut presence = vec![0u8; count.div_ceil(8)];
+    let total: usize = records
+        .iter()
+        .map(|r| r.borrow().text.as_deref().map_or(0, str::len))
+        .sum();
+    let mut body = Vec::with_capacity(presence.len() + 8 * (count + 1) + total);
+    let mut off = 0u64;
+    let mut offsets = Vec::with_capacity(count + 1);
+    offsets.push(0u64);
+    for (i, r) in records.iter().enumerate() {
+        if let Some(t) = &r.borrow().text {
+            presence[i / 8] |= 1 << (i % 8);
+            off += t.len() as u64;
+        }
+        offsets.push(off);
+    }
+    body.extend_from_slice(&presence);
+    for o in &offsets {
+        body.extend_from_slice(&o.to_le_bytes());
+    }
+    for r in records {
+        if let Some(t) = &r.borrow().text {
+            body.extend_from_slice(t.as_bytes());
+        }
+    }
+    body
+}
+
 fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
     let count = records.len();
     let plans = plan_labels(records);
@@ -968,6 +1067,10 @@ fn encode_v2<R: Borrow<Record>>(records: &[R]) -> Result<Vec<u8>> {
     }
 
     push_section(&mut out, &mut dir, K_PAYLOAD, "", &encode_payloads(records));
+
+    if records.iter().any(|r| r.borrow().text.is_some()) {
+        push_section(&mut out, &mut dir, K_TEXT, "", &encode_texts(records));
+    }
 
     let blocks = build_blocks(records, &plans);
     let blocks_body = rmp_serde::to_vec(&blocks).map_err(|e| GirderError::Encode(e.to_string()))?;
@@ -1213,6 +1316,7 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
     let mut numerics: BTreeMap<String, Arc<NumericColumn>> = BTreeMap::new();
     let mut blocks: Option<Vec<BlockMeta>> = None;
     let mut payloads: Option<Arc<PayloadIndex>> = None;
+    let mut texts: Option<Arc<TextIndex>> = None;
 
     for e in &dir.entries {
         let start = e.offset as usize;
@@ -1251,6 +1355,13 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
                 blocks =
                     Some(rmp_serde::from_slice(body).map_err(|e| corrupt(format!("blocks: {e}")))?);
             }
+            K_TEXT => {
+                texts = Some(Arc::new(decode_text_index(
+                    body,
+                    count,
+                    (start + 4) as u64,
+                )?));
+            }
             _ => {} // unknown kind: ignore (forward-compat)
         }
     }
@@ -1270,6 +1381,60 @@ fn decode_v2_columns(bytes: &[u8]) -> Result<SegmentColumns> {
         numerics,
         blocks: Arc::new(blocks),
         payloads: Payloads::File(payloads),
+        texts: texts.map(Texts::File),
+    })
+}
+
+/// Decode a K_TEXT body given the absolute file offset of the body start.
+/// Validates the offset table like the payload table: zero-based, monotonic,
+/// terminating exactly at the blob length.
+fn decode_text_index(body: &[u8], count: usize, body_abs: u64) -> Result<TextIndex> {
+    let presence_len = count.div_ceil(8);
+    let table_len = 8usize
+        .checked_mul(count + 1)
+        .ok_or_else(|| corrupt("text table overflow"))?;
+    if body.len() < presence_len + table_len {
+        return Err(corrupt("text section shorter than header"));
+    }
+    let blob_len = (body.len() - presence_len - table_len) as u64;
+    decode_text_header(&body[..presence_len + table_len], count, body_abs, blob_len)
+}
+
+/// Shared K_TEXT header decoder: presence bitmap + offset table, validated
+/// (zero-based, monotonic, terminating exactly at `blob_len`).
+fn decode_text_header(
+    header: &[u8],
+    count: usize,
+    body_abs: u64,
+    blob_len: u64,
+) -> Result<TextIndex> {
+    let presence_len = count.div_ceil(8);
+    let table_len = 8 * (count + 1);
+    let mut present = Vec::with_capacity(count);
+    for i in 0..count {
+        present.push(header[i / 8] & (1 << (i % 8)) != 0);
+    }
+    let mut c = Cur::new(&header[presence_len..presence_len + table_len]);
+    let mut rel = Vec::with_capacity(count + 1);
+    for _ in 0..count + 1 {
+        rel.push(c.u64()?);
+    }
+    if rel[0] != 0 {
+        return Err(corrupt("text offsets not zero-based"));
+    }
+    if rel.windows(2).any(|w| w[0] > w[1]) {
+        return Err(corrupt("text offsets not monotonic"));
+    }
+    if *rel.last().unwrap() != blob_len {
+        return Err(corrupt(
+            "text offset table inconsistent with section length",
+        ));
+    }
+    let abs_base = body_abs + (presence_len + table_len) as u64;
+    Ok(TextIndex {
+        abs_base,
+        present,
+        rel,
     })
 }
 
@@ -1328,7 +1493,18 @@ pub fn read_all_records(path: &Path) -> Result<Vec<Record>> {
                 let from = (pi.abs_base + pi.rel[i]) as usize;
                 let plen = (pi.rel[i + 1] - pi.rel[i]) as usize;
                 let payload = slice(&bytes, from, plen)?.to_vec();
-                out.push(cols.build_record(i, payload));
+                let text = match &cols.texts {
+                    Some(Texts::File(ti)) if ti.present[i] => {
+                        let tfrom = (ti.abs_base + ti.rel[i]) as usize;
+                        let tlen = (ti.rel[i + 1] - ti.rel[i]) as usize;
+                        Some(
+                            String::from_utf8(slice(&bytes, tfrom, tlen)?.to_vec())
+                                .map_err(|_| corrupt("text not utf8"))?,
+                        )
+                    }
+                    _ => None,
+                };
+                out.push(cols.build_record(i, payload, text));
             }
             Ok(out)
         }
@@ -1535,6 +1711,33 @@ pub fn load_numeric(
     decode_numeric_column(&body, dir.count)
 }
 
+/// Load the text offset table (K_TEXT header: presence + offsets; blob bytes
+/// are sliced per row at materialize time). Returns `None` when the segment
+/// has no text section (pre-text file, or no record carried text).
+pub fn load_text_index(
+    file: &File,
+    dir: &SegDir,
+    bytes_read: &AtomicU64,
+) -> Result<Option<TextIndex>> {
+    let Some(e) = dir.entries.get(&(K_TEXT, String::new())) else {
+        return Ok(None);
+    };
+    let count = dir.count;
+    let presence_len = count.div_ceil(8);
+    let table_len = 8usize
+        .checked_mul(count + 1)
+        .ok_or_else(|| corrupt("text table overflow"))?;
+    if (e.len as usize) < presence_len + table_len {
+        return Err(corrupt("text section shorter than header"));
+    }
+    let header = read_at(file, e.offset + 4, presence_len + table_len, bytes_read)?;
+    let blob_len = e.len - (presence_len + table_len) as u64;
+    // Reuse the shared decoder by handing it just the header + declared blob
+    // length (it validates zero-based/monotonic/terminating).
+    let idx = decode_text_header(&header, count, e.offset + 4, blob_len)?;
+    Ok(Some(idx))
+}
+
 /// Load *only* the payload offset table (the first `8·(count+1)` bytes of the
 /// payload section). The raw payload bytes — the ~GB — are never read here and
 /// their crc is not verified (per-row slices are read on demand at materialize
@@ -1595,6 +1798,7 @@ mod tests {
             labels: BTreeMap::from([("model".to_string(), model.to_string())]),
             numerics: BTreeMap::from([("latency_ms".to_string(), latency)]),
             payload: format!("p-{key}").into_bytes(),
+            text: None,
         }
     }
 
@@ -1798,6 +2002,7 @@ mod tests {
                 labels,
                 numerics,
                 payload: vec![0u8; 4],
+                text: None,
             });
         }
         let mut sorted = records.clone();
@@ -1861,6 +2066,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 numerics: BTreeMap::from([("x".to_string(), f64::NAN)]),
                 payload: vec![],
+                text: None,
             },
             Record {
                 key: "b".into(),
@@ -1868,6 +2074,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 numerics: BTreeMap::from([("x".to_string(), 5.0)]),
                 payload: vec![],
+                text: None,
             },
         ];
         write_segment(&path, &mut records).unwrap();
@@ -1915,5 +2122,54 @@ mod tests {
             key_prefix: Some("a".into()),
             ..Default::default()
         }));
+    }
+
+    /// K_TEXT is emitted only when some record carries text: a text-less
+    /// record set encodes BYTE-IDENTICAL with or without the text machinery
+    /// (the section is simply absent), and text round-trips at the segment
+    /// level through both whole-file readers.
+    #[test]
+    fn text_section_only_when_text_present() {
+        let no_text: Vec<Record> = (0..5)
+            .map(|i| record(&format!("k{i}"), i, "m", 1.0))
+            .collect();
+        let bytes = encode_v2(&no_text.iter().collect::<Vec<_>>()).unwrap();
+        let dir_has_text = {
+            // decode footer directly
+            let len = bytes.len();
+            let footer_off =
+                u64::from_le_bytes(bytes[len - 16..len - 8].try_into().unwrap()) as usize;
+            let dir: SectionDir = rmp_serde::from_slice(&bytes[footer_off..len - 16]).unwrap();
+            dir.entries.iter().any(|e| e.kind == K_TEXT)
+        };
+        assert!(
+            !dir_has_text,
+            "text-less segment must have no K_TEXT section"
+        );
+
+        let mut with_text = no_text.clone();
+        with_text[1].text = Some("Hello, World!".into());
+        with_text[3].text = Some(String::new()); // empty ≠ absent
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.gird");
+        let mut sorted = with_text.clone();
+        write_segment(&path, &mut sorted).unwrap();
+
+        // Whole-file record reader (compaction path).
+        let back = read_all_records(&path).unwrap();
+        assert_eq!(back[1].text.as_deref(), Some("Hello, World!"));
+        assert_eq!(back[3].text.as_deref(), Some(""));
+        assert_eq!(back[0].text, None);
+
+        // Column view + per-row materialize (scan path).
+        let cols = read_columns(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let br = std::sync::atomic::AtomicU64::new(0);
+        let r1 = cols.materialize(1, Some(&file), &br).unwrap();
+        assert_eq!(r1.text.as_deref(), Some("Hello, World!"));
+        let r0 = cols.materialize(0, Some(&file), &br).unwrap();
+        assert_eq!(r0.text, None);
+        let r3 = cols.materialize(3, Some(&file), &br).unwrap();
+        assert_eq!(r3.text.as_deref(), Some(""));
     }
 }

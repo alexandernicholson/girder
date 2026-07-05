@@ -48,6 +48,6 @@ mod wal;
 
 pub use engine::{Girder, GirderConfig, Stats};
 pub use error::{GirderError, Result};
-pub use record::{OrderBy, QuerySpec, Record};
+pub use record::{OrderBy, QuerySpec, Record, TOMBSTONE_LABEL};
 pub use text::fts_tokens;
 pub use wal::FsyncPolicy;

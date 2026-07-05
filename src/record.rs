@@ -212,10 +212,43 @@ impl QuerySpec {
 /// The `girder.` label prefix is reserved for the engine.
 pub const DELTA_LABEL: &str = "girder.delta";
 
+/// Reserved label marking a **tombstone** (a delete written by
+/// [`crate::Girder::delete`]): the key's newest version is "gone" — reads
+/// exclude it from results while it keeps shadowing every older version of
+/// the key (see `docs/GUARANTEES.md` §Deletes). The un-namespaced name is
+/// deliberate: it formalizes the embedder convention rivet has written to
+/// disk since the first tombstone, so every pre-existing delete is engine
+/// vocabulary retroactively — no migration, no second marker.
+pub const TOMBSTONE_LABEL: &str = "del";
+
 impl Record {
     /// Is this a delta (increment) record rather than a full value?
     pub fn is_delta(&self) -> bool {
         self.labels.get(DELTA_LABEL).map(String::as_str) == Some("1")
+    }
+
+    /// Is this a tombstone (delete marker)?
+    pub fn is_tombstone(&self) -> bool {
+        self.labels.get(TOMBSTONE_LABEL).map(String::as_str) == Some("1")
+    }
+
+    /// The canonical tombstone for `key`. `timestamp` must be ≥ the
+    /// timestamp of every version it shadows (callers use the delete time):
+    /// retention judges a key by its winning version's own timestamp, so a
+    /// back-dated tombstone could expire before the data it shadows and
+    /// resurrect it at grooming (`docs/GUARANTEES.md` §Deletes).
+    pub fn tombstone(key: impl Into<String>, timestamp: i64) -> Record {
+        Record {
+            key: key.into(),
+            timestamp,
+            labels: std::collections::BTreeMap::from([(
+                TOMBSTONE_LABEL.to_string(),
+                "1".to_string(),
+            )]),
+            numerics: std::collections::BTreeMap::new(),
+            payload: Vec::new(),
+            text: None,
+        }
     }
 
     pub(crate) fn set_delta(&mut self) {
@@ -243,6 +276,18 @@ impl Record {
 pub(crate) fn merge_delta(base: Option<&Record>, delta: &Record) -> Record {
     match base {
         None => delta.clone(),
+        // A tombstone base terminates the fold contributing nothing AND
+        // basifies the chain: the increments become a full value (the
+        // delta-chain-with-no-base rule) so nothing older can ever fold in
+        // beneath the delete — delete-then-incr re-creates the counter from
+        // zero (`docs/GUARANTEES.md` §Deletes). One rule, one oracle: every
+        // fold site (memtable insert, get, scan_fold, compaction, WAL
+        // replay) inherits both the reset and the termination from here.
+        Some(base) if base.is_tombstone() => {
+            let mut merged = delta.clone();
+            merged.clear_delta();
+            merged
+        }
         Some(base) => {
             let mut merged = base.clone();
             for (name, v) in &delta.numerics {

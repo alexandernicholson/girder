@@ -308,6 +308,24 @@ impl Girder {
         self.put_batch(vec![record]).await
     }
 
+    /// Delete `key`: write the canonical tombstone (`docs/GUARANTEES.md`
+    /// §Deletes). The key vanishes from `get`/`scan`/`count` while the
+    /// tombstone keeps shadowing every older version through the same
+    /// newest-wins walk as any write. Durable like a put; reclaimed at
+    /// compaction/retention like any record.
+    ///
+    /// `timestamp` must be ≥ the timestamp of every version it shadows —
+    /// use the delete time. Retention judges a key by its winning version's
+    /// own timestamp, so a back-dated tombstone can expire (and be groomed)
+    /// before the data it shadows, resurrecting it.
+    ///
+    /// Deleting a key with pending counter deltas resets the counter:
+    /// increments newer than the tombstone re-create the row from zero
+    /// (the delta-chain-with-no-base rule, one fold oracle).
+    pub async fn delete(&self, key: impl Into<String>, timestamp: i64) -> Result<()> {
+        self.put(Record::tombstone(key, timestamp)).await
+    }
+
     /// Atomic counter increment: add `deltas` onto `key`'s numerics (creating
     /// the record if absent), serialized through the single writer — two
     /// concurrent `incr`s can never lose an update (unlike a read-modify-write
@@ -490,6 +508,8 @@ impl Girder {
                 }
                 Some(p) => {
                     // `p` is the fold of all NEWER deltas; `version` is older.
+                    // (A tombstone `version` basifies the chain — the merge
+                    // oracle's reset-and-terminate rule.)
                     let merged = crate::record::merge_delta(Some(version), &p);
                     if merged.is_delta() {
                         *pending = Some(merged);
@@ -502,7 +522,7 @@ impl Girder {
         };
         if let Some(record) = self.inner.memtable.read().unwrap().get(key) {
             if let Some(done) = fold(&mut pending, record) {
-                return Ok(Some(finish_fold(done)));
+                return Ok(surface(done));
             }
         }
         {
@@ -510,7 +530,7 @@ impl Girder {
             for (_, map) in frozen.iter().rev() {
                 if let Some(record) = map.get(key) {
                     if let Some(done) = fold(&mut pending, record) {
-                        return Ok(Some(finish_fold(done)));
+                        return Ok(surface(done));
                     }
                 }
             }
@@ -525,12 +545,12 @@ impl Girder {
             if let Some(idx) = cols.find_key(key) {
                 let record = cols.materialize(idx, file.as_ref(), &self.inner.stats_bytes_read)?;
                 if let Some(done) = fold(&mut pending, &record) {
-                    return Ok(Some(finish_fold(done)));
+                    return Ok(surface(done));
                 }
             }
         }
         // A delta chain with no base = the row as created by increments.
-        Ok(pending.map(finish_fold))
+        Ok(pending.and_then(surface))
     }
 
     /// Scan matching records.
@@ -590,9 +610,9 @@ impl Girder {
     ///   are ignored (they don't change membership).
     /// - Counter deltas in range force the fold fallback (decode-heavy but
     ///   exact) — raw delta rows must never be counted per-version.
-    /// - Records are counted as-matched: an embedder's tombstone convention
-    ///   excludes itself the same way it does from `scan` (e.g. a label
-    ///   predicate the tombstone lacks).
+    /// - Tombstones are engine vocabulary: a deleted key is not counted, and
+    ///   its tombstone shadows older versions through the same walk plan
+    ///   `scan` uses (`docs/GUARANTEES.md` §Deletes).
     pub async fn count(&self, spec: &QuerySpec) -> Result<usize> {
         if spec.after.is_some() {
             return Err(GirderError::Config(
@@ -626,7 +646,10 @@ impl Girder {
             let memtable = self.inner.memtable.read().unwrap();
             let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for record in memtable.values() {
-                if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                if seen.insert(record.key.clone())
+                    && !record.is_tombstone()
+                    && mem_matches(spec, record, cand.as_ref())
+                {
                     n += 1;
                 }
             }
@@ -636,23 +659,35 @@ impl Girder {
             for (_, map) in frozen.iter().rev() {
                 let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for record in map.values() {
-                    if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                    if seen.insert(record.key.clone())
+                        && !record.is_tombstone()
+                        && mem_matches(spec, record, cand.as_ref())
+                    {
                         n += 1;
                     }
                 }
             }
         }
-        let metas = self.pruned_segments(spec);
-        let disjoint = key_ranges_disjoint(&metas);
-        let last = metas.len().saturating_sub(1);
-        for (idx, meta) in metas.iter().enumerate() {
-            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
+        // The same shared walk plan as `scan_full` — the count's membership
+        // and the page's membership cannot disagree (the pinned oracle).
+        let plan = self.walk_plan(spec);
+        let last = plan.steps.len().saturating_sub(1);
+        for (idx, step) in plan.steps.iter().enumerate() {
+            if !step.visit {
+                let keys = self.load_segment_keys(&step.meta)?;
+                for i in 0..keys.count() {
+                    seen.insert(keys.key_at(i).to_string());
+                }
+                continue;
+            }
+            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
             for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
-                if !seen.contains(cols.key_at(row as usize)) {
+                let r = row as usize;
+                if !seen.contains(cols.key_at(r)) && !cols.is_tombstone_at(r) {
                     n += 1;
                 }
             }
-            if !disjoint && idx != last {
+            if plan.track_shadows && idx != last {
                 for i in 0..cols.count() {
                     seen.insert(cols.key_at(i).to_string());
                 }
@@ -712,12 +747,16 @@ impl Girder {
                     if record.is_delta() {
                         v.insert(Fold::Pending(record.clone()));
                     } else {
+                        // A tombstone lands here as Done: it shadows every
+                        // older version and is dropped at the output filter.
                         v.insert(Fold::Done(record.clone()));
                     }
                 }
                 Entry::Occupied(mut o) => {
                     if let Fold::Pending(p) = o.get() {
-                        // `p` folds all newer deltas; `record` is older.
+                        // `p` folds all newer deltas; `record` is older. (A
+                        // tombstone `record` basifies the chain — the merge
+                        // oracle's reset-and-terminate rule.)
                         let merged = crate::record::merge_delta(Some(record), p);
                         o.insert(if merged.is_delta() {
                             Fold::Pending(merged)
@@ -767,7 +806,7 @@ impl Girder {
             .map(|f| match f {
                 Fold::Done(r) | Fold::Pending(r) => finish_fold(r),
             })
-            .filter(|r| spec.matches(r) && spec.after_bound_ok(r))
+            .filter(|r| !r.is_tombstone() && spec.matches(r) && spec.after_bound_ok(r))
             .collect();
         let order = spec.order_by.as_ref();
         out.sort_by(|a, b| record_cmp(order, a, b));
@@ -787,11 +826,13 @@ impl Girder {
 
         // Recency order: memtable → frozen (newest first) seed `seen` with all
         // their keys (matching or not) so they shadow older segment versions.
+        // Tombstones seed `seen` like any record but are never emitted.
         {
             let memtable = self.inner.memtable.read().unwrap();
             let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for record in memtable.values() {
                 if seen.insert(record.key.clone())
+                    && !record.is_tombstone()
                     && mem_matches(spec, record, cand.as_ref())
                     && spec.after_bound_ok(record)
                 {
@@ -805,6 +846,7 @@ impl Girder {
                 let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for record in map.values() {
                     if seen.insert(record.key.clone())
+                        && !record.is_tombstone()
                         && mem_matches(spec, record, cand.as_ref())
                         && spec.after_bound_ok(record)
                     {
@@ -814,25 +856,33 @@ impl Girder {
             }
         }
 
-        // Segments, newest-id first. If their key ranges are pairwise disjoint
-        // (the compacted / append-only common case) a key can live in at most
-        // one segment, so no cross-segment shadow tracking is needed — only
-        // membership checks against the memtable/frozen seed. Otherwise fall
-        // back to inserting every visited key of each non-final source so a
+        // Segments in the shared newest-wins walk plan (see `walk_plan`).
+        // When key ranges are pairwise disjoint (the compacted / append-only
+        // common case) a key can live in at most one segment, so no
+        // cross-segment shadow tracking is needed — only membership checks
+        // against the memtable/frozen seed. Otherwise every step of each
+        // non-final source folds its keys into `seen` — visit steps after
+        // emitting, shadow steps as their whole purpose — so a zone- or
         // block-pruned newer version still shadows an older match.
-        let metas = self.pruned_segments(spec);
-        let disjoint = key_ranges_disjoint(&metas);
-        let last = metas.len().saturating_sub(1);
-        for (idx, meta) in metas.iter().enumerate() {
+        let plan = self.walk_plan(spec);
+        let last = plan.steps.len().saturating_sub(1);
+        for (idx, step) in plan.steps.iter().enumerate() {
+            if !step.visit {
+                let keys = self.load_segment_keys(&step.meta)?;
+                for i in 0..keys.count() {
+                    seen.insert(keys.key_at(i).to_string());
+                }
+                continue;
+            }
             // One open file handle is held across this segment's whole
             // materialize loop, so a concurrent hot→cold rename can't tear the
             // per-row payload reads (the fd stays valid on unix).
-            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
+            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
             let rows = cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)?;
             if !rows.is_empty() {
                 for &row in &rows {
                     let r = row as usize;
-                    if !seen.contains(cols.key_at(r)) {
+                    if !seen.contains(cols.key_at(r)) && !cols.is_tombstone_at(r) {
                         if !after_ok_cols(spec, cols.timestamp_at(r), cols.key_at(r)) {
                             continue; // bound applies to the winning version
                         }
@@ -844,7 +894,7 @@ impl Girder {
                     }
                 }
             }
-            if !disjoint && idx != last {
+            if plan.track_shadows && idx != last {
                 for i in 0..cols.count() {
                     seen.insert(cols.key_at(i).to_string());
                 }
@@ -897,7 +947,11 @@ impl Girder {
             let cand = want.as_ref().map(|w| memtable.text_candidates(w));
             for rec in memtable.values() {
                 let fresh = seen.insert(rec.key.clone());
-                if fresh && mem_matches(spec, rec, cand.as_ref()) && spec.after_bound_ok(rec) {
+                if fresh
+                    && !rec.is_tombstone()
+                    && mem_matches(spec, rec, cand.as_ref())
+                    && spec.after_bound_ok(rec)
+                {
                     let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                     let prim = make_prim(order, rec.timestamp, num);
                     offer(&mut heap, limit, prim, &rec.key, || {
@@ -912,7 +966,11 @@ impl Girder {
                 let cand = want.as_ref().map(|w| map.text_candidates(w));
                 for rec in map.values() {
                     let fresh = seen.insert(rec.key.clone());
-                    if fresh && mem_matches(spec, rec, cand.as_ref()) && spec.after_bound_ok(rec) {
+                    if fresh
+                        && !rec.is_tombstone()
+                        && mem_matches(spec, rec, cand.as_ref())
+                        && spec.after_bound_ok(rec)
+                    {
                         let num = numeric_name.and_then(|n| rec.numerics.get(n).copied());
                         let prim = make_prim(order, rec.timestamp, num);
                         offer(&mut heap, limit, prim, &rec.key, || {
@@ -923,25 +981,38 @@ impl Girder {
             }
         }
 
-        // Phase 2: segments newest-id first, with suffix-max early termination.
-        let metas = self.pruned_segments(spec);
-        let disjoint = key_ranges_disjoint(&metas);
-        let suffix_max = suffix_max_ts(&metas);
-        for (i, meta) in metas.iter().enumerate() {
+        // Phase 2: the shared newest-wins walk plan (see `walk_plan`), with
+        // suffix-max early termination over its visit steps. Breaking early
+        // skips the remaining (older) steps entirely — shadow steps included,
+        // soundly: a shadow read only ever protects against segments older
+        // than itself, which the break refuses to visit anyway.
+        let plan = self.walk_plan(spec);
+        let suffix_max = suffix_max_ts(&plan.steps);
+        for (i, step) in plan.steps.iter().enumerate() {
             if early_term && heap.len() >= limit {
                 let worst_ts = heap.peek().unwrap().timestamp();
                 if suffix_max[i] < worst_ts {
                     break; // sound stop — see the doc comment above.
                 }
             }
+            if !step.visit {
+                let keys = self.load_segment_keys(&step.meta)?;
+                for r in 0..keys.count() {
+                    seen.insert(keys.key_at(r).to_string());
+                }
+                continue;
+            }
             // Heap phase needs only the columns (keys/ts/order-numeric); the
             // file handle is reopened lazily for the surviving rows at drain.
-            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
+            let (cols, file) = self.load_segment(&step.meta, spec.text_match.is_some())?;
             for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 let r = row as usize;
                 let key = cols.key_at(r);
                 if seen.contains(key) {
                     continue; // shadowed by a newer source
+                }
+                if cols.is_tombstone_at(r) {
+                    continue; // deleted: never a candidate (still shadows below)
                 }
                 if !after_ok_cols(spec, cols.timestamp_at(r), key) {
                     continue; // keyset bound: post-LWW (shadow check above)
@@ -954,7 +1025,7 @@ impl Girder {
                     row: r,
                 });
             }
-            if !disjoint {
+            if plan.track_shadows {
                 for r in 0..cols.count() {
                     seen.insert(cols.key_at(r).to_string());
                 }
@@ -972,7 +1043,7 @@ impl Girder {
                     meta_idx,
                     row,
                 } => {
-                    let file = self.open_payload_file(&metas[meta_idx], &cols)?;
+                    let file = self.open_payload_file(&plan.steps[meta_idx].meta, &cols)?;
                     out.push(cols.materialize(row, file.as_ref(), &self.inner.stats_bytes_read)?);
                 }
             }
@@ -991,6 +1062,124 @@ impl Girder {
             .collect();
         metas.sort_by_key(|m| std::cmp::Reverse(m.id));
         metas
+    }
+
+    /// The newest-wins segment walk for `spec` (`docs/GUARANTEES.md`
+    /// §Shadowing). Shared by `scan_full`, `scan_topk` and `count_full` so
+    /// the three read paths cannot disagree about shadowing.
+    ///
+    /// A `visit` step zone-matches the spec and is read fully. A shadow step
+    /// (`visit == false`) CANNOT match, but key-overlaps an *older* visit
+    /// step — a newer version of a key living there still shadows an older,
+    /// matching version (LWW), so the walk must fold its KEYS (never its
+    /// payloads) into the shadow set. Zone pruning alone would drop it and
+    /// resurrect the older version: that was the un-shadowing bug
+    /// (`tests/lww_shadowing.rs` — tombstone AND label-changed-rewrite
+    /// shapes both reproduce it).
+    ///
+    /// `track_shadows == false` means the WHOLE plan's key ranges (visit ∪
+    /// shadow — computing disjointness over the zone-filtered list only was
+    /// part of the bug) are pairwise disjoint: a key lives in at most one
+    /// plan segment, shadow steps are dropped, and no per-segment `seen`
+    /// seeding is needed — the compacted-store fast path, byte-identical to
+    /// the historical walk.
+    fn walk_plan(&self, spec: &QuerySpec) -> WalkPlan {
+        let mut steps: Vec<WalkStep> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            manifest
+                .segments
+                .iter()
+                .filter(|meta| meta.zone.may_overlap_prefix(spec))
+                .map(|meta| WalkStep {
+                    visit: meta.zone.may_match(spec),
+                    meta: meta.clone(),
+                })
+                .collect()
+        };
+        steps.sort_by_key(|s| std::cmp::Reverse(s.meta.id));
+        // A shadow step earns its key read only if some OLDER visit step
+        // could share a key with it; anything else contributes nothing.
+        // (Trim before the disjointness check: an irrelevant overlap between
+        // two never-visited segments must not disable the fast path. Sound:
+        // if a trimmed segment held a newer version of an emittable key, the
+        // key's older, matching version sits in an older visit step whose
+        // range then overlaps it — so it would have been kept.)
+        let keep: Vec<bool> = steps
+            .iter()
+            .map(|s| {
+                s.visit
+                    || steps.iter().any(|v| {
+                        v.visit
+                            && v.meta.id < s.meta.id
+                            && v.meta.zone.key_range_overlaps(&s.meta.zone)
+                    })
+            })
+            .collect();
+        let mut keep = keep.iter();
+        steps.retain(|_| *keep.next().unwrap());
+        let disjoint = key_ranges_disjoint(steps.iter().map(|s| &s.meta));
+        if disjoint {
+            steps.retain(|s| s.visit);
+        }
+        WalkPlan {
+            steps,
+            track_shadows: !disjoint,
+        }
+    }
+
+    /// The key column of a segment, for shadow reads: v2 loads (and caches)
+    /// the footer directory + keys section only; v1 legacy segments are one
+    /// whole-file bundle either way. Payloads are never touched.
+    fn load_segment_keys(&self, meta: &crate::manifest::SegmentMeta) -> Result<SegKeys> {
+        let id = meta.cache_key();
+        if let Some(Section::V1Whole(cols)) = self.inner.cache.get(id, SectionId::V1Whole) {
+            self.note_cache_hit();
+            return Ok(SegKeys::Whole(cols));
+        }
+        let file = self.open_segment_file(meta)?;
+        let mut disk = false;
+        let dir = match self.segment_dir(id, &file, &mut disk)? {
+            DirOrWhole::Whole(cols) => {
+                self.note_cache_miss();
+                return Ok(SegKeys::Whole(cols));
+            }
+            DirOrWhole::Dir(dir) => dir,
+        };
+        let keys = self.section_keys(id, &dir, &file, &mut disk)?;
+        if disk {
+            self.note_cache_miss();
+        } else {
+            self.note_cache_hit();
+        }
+        Ok(SegKeys::Slim(keys))
+    }
+
+    /// The segment's section directory: cached, or parsed from the footer
+    /// (v2) / detected-and-fully-loaded as a legacy v1 bundle. Shared by
+    /// `load_segment` and `load_segment_keys` so version detection and
+    /// caching cannot diverge.
+    fn segment_dir(&self, id: u64, file: &std::fs::File, disk: &mut bool) -> Result<DirOrWhole> {
+        if let Some(Section::Dir(d)) = self.inner.cache.get(id, SectionId::Dir) {
+            return Ok(DirOrWhole::Dir(d));
+        }
+        *disk = true;
+        let br = &self.inner.stats_bytes_read;
+        match segment::read_header(file, br)? {
+            1 => {
+                let cols = Arc::new(segment::load_v1_whole(file, br)?);
+                self.cache_put(id, SectionId::V1Whole, Section::V1Whole(Arc::clone(&cols)));
+                Ok(DirOrWhole::Whole(cols))
+            }
+            2 => {
+                let d = Arc::new(segment::read_footer(file, br)?);
+                self.cache_put(id, SectionId::Dir, Section::Dir(Arc::clone(&d)));
+                Ok(DirOrWhole::Dir(d))
+            }
+            other => Err(GirderError::Corrupt {
+                what: "segment",
+                detail: format!("unsupported version {other}"),
+            }),
+        }
     }
 
     /// Assemble a segment's decoded columns from the section cache, reading only
@@ -1025,34 +1214,14 @@ impl Girder {
         }
 
         let file = self.open_segment_file(meta)?;
-        let br = &self.inner.stats_bytes_read;
         let mut disk = false;
 
-        // Directory: cached, or parsed from the footer (v2) / detected as v1.
-        let dir = match cache.get(id, SectionId::Dir) {
-            Some(Section::Dir(d)) => d,
-            _ => {
-                disk = true;
-                match segment::read_header(&file, br)? {
-                    1 => {
-                        let cols = Arc::new(segment::load_v1_whole(&file, br)?);
-                        self.cache_put(id, SectionId::V1Whole, Section::V1Whole(Arc::clone(&cols)));
-                        self.note_cache_miss();
-                        return Ok((cols, None));
-                    }
-                    2 => {
-                        let d = Arc::new(segment::read_footer(&file, br)?);
-                        self.cache_put(id, SectionId::Dir, Section::Dir(Arc::clone(&d)));
-                        d
-                    }
-                    other => {
-                        return Err(GirderError::Corrupt {
-                            what: "segment",
-                            detail: format!("unsupported version {other}"),
-                        })
-                    }
-                }
+        let dir = match self.segment_dir(id, &file, &mut disk)? {
+            DirOrWhole::Whole(cols) => {
+                self.note_cache_miss();
+                return Ok((cols, None));
             }
+            DirOrWhole::Dir(dir) => dir,
         };
 
         let count = dir.count();
@@ -1392,6 +1561,17 @@ fn finish_fold(mut record: Record) -> Record {
     record
 }
 
+/// A folded record leaving `get`: strip internal bookkeeping, then apply the
+/// tombstone vocabulary — a deleted key reads as absent, never as its marker.
+fn surface(record: Record) -> Option<Record> {
+    let record = finish_fold(record);
+    if record.is_tombstone() {
+        None
+    } else {
+        Some(record)
+    }
+}
+
 /// The query's text tokens, when a text predicate is present.
 fn text_query_tokens(spec: &QuerySpec) -> Option<Vec<String>> {
     spec.text_match.as_deref().map(crate::text::fts_tokens)
@@ -1432,13 +1612,53 @@ fn after_ok_cols(spec: &QuerySpec, ts: i64, key: &str) -> bool {
 
 /// Are the segments' key ranges pairwise disjoint? If so, a key can appear in
 /// at most one segment and cross-segment shadow tracking is unnecessary.
-fn key_ranges_disjoint(metas: &[SegmentMeta]) -> bool {
+fn key_ranges_disjoint<'a>(metas: impl Iterator<Item = &'a SegmentMeta>) -> bool {
     let mut ranges: Vec<(&str, &str)> = metas
-        .iter()
         .map(|m| (m.zone.min_key.as_str(), m.zone.max_key.as_str()))
         .collect();
     ranges.sort_by(|a, b| a.0.cmp(b.0));
     ranges.windows(2).all(|w| w[0].1 < w[1].0)
+}
+
+/// One segment in a [`WalkPlan`]: read fully (`visit`) or keys-only (shadow).
+struct WalkStep {
+    meta: SegmentMeta,
+    visit: bool,
+}
+
+/// The newest-first segment walk `Girder::walk_plan` builds for a spec: the
+/// steps in recency order plus whether cross-segment shadow tracking (`seen`
+/// seeding + shadow-step key reads) is needed at all.
+struct WalkPlan {
+    steps: Vec<WalkStep>,
+    track_shadows: bool,
+}
+
+/// A segment's section directory, or the whole decoded bundle for legacy v1.
+enum DirOrWhole {
+    Dir(Arc<SegDir>),
+    Whole(Arc<SegmentColumns>),
+}
+
+/// A segment's key column for shadow reads (v2: the keys section alone).
+enum SegKeys {
+    Slim(Arc<KeysSection>),
+    Whole(Arc<SegmentColumns>),
+}
+
+impl SegKeys {
+    fn count(&self) -> usize {
+        match self {
+            SegKeys::Slim(k) => k.count(),
+            SegKeys::Whole(cols) => cols.count(),
+        }
+    }
+    fn key_at(&self, i: usize) -> &str {
+        match self {
+            SegKeys::Slim(k) => k.key_at(i),
+            SegKeys::Whole(cols) => cols.key_at(i),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,11 +1817,16 @@ fn offer<F: FnOnce() -> CandSrc>(
 
 /// `out[i] = max(zone.max_ts)` over segments `i..` of an already newest-first
 /// meta list — the suffix bound driving timestamp-desc early termination.
-fn suffix_max_ts(metas: &[SegmentMeta]) -> Vec<i64> {
-    let mut out = vec![i64::MIN; metas.len()];
+fn suffix_max_ts(steps: &[WalkStep]) -> Vec<i64> {
+    let mut out = vec![i64::MIN; steps.len()];
     let mut acc = i64::MIN;
-    for i in (0..metas.len()).rev() {
-        acc = acc.max(metas[i].zone.max_ts);
+    for i in (0..steps.len()).rev() {
+        // Shadow steps never emit candidates, so they contribute nothing to
+        // "can any unvisited row still enter the page?" — only visit steps'
+        // max timestamps count toward the early-termination bound.
+        if steps[i].visit {
+            acc = acc.max(steps[i].meta.zone.max_ts);
+        }
         out[i] = acc;
     }
     out

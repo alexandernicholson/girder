@@ -18,6 +18,18 @@ directory is self-describing `(kind, name, offset, len, crc)` entries and
 readers ignore unknown kinds — adding a section (K_TEXT/K_TOKENS were added
 this way) requires no version bump.
 
+## Deletes / tombstone vocabulary (no format change)
+
+The delete API and the G5 shadowing guarantee (`docs/GUARANTEES.md`
+§Deletes) introduced **no on-disk format change**: a tombstone is an
+ordinary record labelled `del=1`, and the walk fix is read-path-only
+(segment key ranges were already in the manifest zone maps). Pre-existing
+embedder tombstones — including rivet's historical `timestamp: 0` shape —
+are engine tombstones retroactively: they shadow correctly and read as
+absent under every spec. Their one residual hazard is retention (a ts=0
+tombstone TTL-expires immediately; the embedder should write delete-time
+timestamps going forward — GUARANTEES §Deletes, timestamp rule).
+
 ## Background migration
 
 Legacy segments are rewritten to the current format by a maintenance-tick

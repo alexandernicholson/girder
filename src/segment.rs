@@ -183,6 +183,24 @@ impl ZoneMap {
         }
         true
     }
+
+    /// Key-range-only face of [`ZoneMap::may_match`]: could this segment hold
+    /// any key under the spec's prefix? Time/label/numeric zones deliberately
+    /// NOT consulted — this is the shadow-candidate test: a newer version of
+    /// a key shadows older versions whether or not IT matches the spec, so a
+    /// segment may be excused from the newest-wins walk only when it cannot
+    /// share a key with it (see `Girder::walk_plan`).
+    pub fn may_overlap_prefix(&self, spec: &QuerySpec) -> bool {
+        match &spec.key_prefix {
+            None => true,
+            Some(p) => key_range_overlaps_prefix(&self.min_key, &self.max_key, p),
+        }
+    }
+
+    /// Do two segments' key ranges intersect (i.e. could they share a key)?
+    pub fn key_range_overlaps(&self, other: &ZoneMap) -> bool {
+        !(self.max_key < other.min_key || other.max_key < self.min_key)
+    }
 }
 
 /// Does the key range `[min_key, max_key]` overlap the set of keys starting
@@ -442,6 +460,25 @@ impl SegmentColumns {
     /// True if materializing a row needs the segment file open (v2 payloads).
     pub fn payload_needs_file(&self) -> bool {
         matches!(self.payloads, Payloads::File(_))
+    }
+
+    /// Value of label `name` at row `i`, or `None` if absent. No payload touch.
+    pub fn label_value_at(&self, name: &str, i: usize) -> Option<&str> {
+        match self.labels.get(name)?.as_ref() {
+            LabelColumn::Dict { dict, codes, .. } => match codes[i] {
+                0 => None,
+                c => Some(dict[(c - 1) as usize].as_str()),
+            },
+            LabelColumn::Plain { values } => values[i].as_deref(),
+        }
+    }
+
+    /// Is row `i` a tombstone (delete marker)? The column-side face of
+    /// [`crate::Record::is_tombstone`] — reads exclude such rows from
+    /// results while their keys keep shadowing older versions.
+    #[inline]
+    pub fn is_tombstone_at(&self, i: usize) -> bool {
+        self.label_value_at(crate::record::TOMBSTONE_LABEL, i) == Some("1")
     }
 
     /// Binary search the (sorted) key column.

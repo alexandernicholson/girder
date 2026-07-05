@@ -38,6 +38,49 @@ to concurrent `get`/`scan` all at once (the batch is inserted under one
 memtable write lock): a reader never observes a partially applied batch from
 a live engine.
 
+**G5 — LWW holds under every query condition (shadowing).** G1–G2 are
+promises about the *whole* store, not just unconditioned reads: a
+label-scoped, time-windowed or numeric-ranged `scan`/`count` never returns a
+key's older version when a newer version exists — even when that newer
+version itself matches nothing (a tombstone, or a rewrite whose label values
+changed). Mechanically: the three read paths share one **walk plan** —
+every segment whose key range overlaps the walk contributes its keys to the
+shadow set; zone-matching segments as full visits, zone-pruned ones as
+keys-only reads (payloads untouched); range-disjointness (computed over the
+full prefix-overlapping set) skips all shadow bookkeeping in the compacted
+common case. Pinned by `tests/lww_shadowing.rs`, which holds all three paths
+to a naive newest-write-wins oracle.
+
+## Deletes (`delete`)
+
+`delete(key, timestamp)` writes the canonical **tombstone**: an empty-payload
+record labelled `del=1` (`TOMBSTONE_LABEL`). Tombstones are engine
+vocabulary:
+
+- **A deleted key reads as absent.** `get` returns `None`; `scan`/`count`
+  never return or count a tombstone. The tombstone still *shadows* every
+  older version of its key (G5) until compaction/retention physically drops
+  them.
+- **LWW applies.** A later `put` of the key simply wins (write order, G1) —
+  delete is not a lock, and there is no un-delete other than rewriting.
+- **Delete-then-`incr` resets the counter.** A tombstone base terminates the
+  delta fold contributing nothing and *basifies* the chain (the
+  delta-chain-with-no-base rule, in the single `merge_delta` oracle):
+  increments newer than the tombstone re-create the row from zero, and
+  nothing older can fold in beneath the delete.
+- **Timestamp rule.** The tombstone's `timestamp` must be ≥ that of every
+  version it shadows — pass the delete time. Retention judges a key by its
+  winning version's own timestamp (see §Retention), so a back-dated
+  tombstone can expire and be groomed *before* the data it shadows,
+  resurrecting it at the next label- or time-scoped read. Pre-existing
+  embedder tombstones written with `timestamp: 0` shadow correctly (G5) but
+  carry that retention hazard until rewritten.
+- The label `del` is reserved alongside `girder.delta`: a record carrying
+  `del=1` **is** a tombstone to the engine, whoever wrote it. (Deliberately
+  un-namespaced: it formalizes the embedder convention already on disk, so
+  every historical tombstone gained these semantics retroactively with no
+  migration.)
+
 ## Counters (`incr`)
 
 `Girder::incr(key, ts, deltas)` adds numeric deltas onto a key atomically:
@@ -150,10 +193,10 @@ These are deliberate; do not build on their absence being accidental.
   overwrite a key with an older timestamp, the overwrite wins (G1) — and the
   surviving record is then judged by *its own* timestamp for retention TTL,
   so it may be dropped at the next compaction if that timestamp is expired.
-- **No delete API.** Records leave only via retention TTL at compaction.
-  Embedders needing point deletes layer a tombstone convention on top (write
-  a marker record for the key and filter it at read — last write wins does
-  the rest).
+- **Deletes are logical until compaction.** `delete` (see §Deletes) makes a
+  key read as absent immediately, but the bytes of shadowed versions leave
+  the store only when compaction/retention physically drops them — there is
+  no synchronous physical erase.
 
 ## Why this holds by construction
 

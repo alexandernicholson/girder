@@ -291,12 +291,25 @@ async fn tombstone_shadowing_older_rows_survives_reclaim() {
         "old version resurrected in scan"
     );
 
-    // NOTE (deliberate omission): a LABEL-conditioned scan (`state == live`)
-    // can still resurrect the old version here — the tombstone-holding
-    // segment is zone-pruned out of the walk, so its keys never shadow.
-    // That is the pre-existing engine bug track-d is fixing (first-class
-    // delete + has_tombstones zone flag + force-visit-for-seen); it fires
-    // with or without a reclaim and is NOT introduced by this slice.
-    // Once that fix lands and this branch rebases onto it, add:
-    //   scan(labels: [(state, live)], key_prefix: m/) must be empty.
+    // The label-conditioned resurrection shape (the G5 walk fix): the
+    // reclaim-rewritten segment holding the shadowing version matches
+    // `state == live` for NOTHING, so pre-G5 zone pruning dropped it from
+    // the walk and the old live version un-shadowed. With G5's keys-only
+    // shadow reads, the rewritten segment still shadows — the scan must be
+    // empty. (This assertion was deliberately deferred until the walk fix
+    // landed; the bug fired with or without a reclaim.)
+    let spec = QuerySpec {
+        labels: vec![("state".into(), "live".into())],
+        key_prefix: Some("m/".into()),
+        ..Default::default()
+    };
+    assert!(
+        engine.scan(&spec).await.unwrap().is_empty(),
+        "live-labelled scan must not see the shadowed version (G5)"
+    );
+    assert_eq!(
+        engine.count(&spec).await.unwrap(),
+        0,
+        "count shares the walk (G5) — no resurrection there either"
+    );
 }

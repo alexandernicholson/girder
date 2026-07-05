@@ -460,10 +460,43 @@ impl SegmentColumns {
         n + 256
     }
 
-    /// Row indices matching `spec`, using the block index to skip whole blocks.
-    /// Returns empty if any required label/numeric column is absent from the
-    /// segment (mirrors `QuerySpec::matches` semantics: absent ⇒ no match).
-    pub fn matching_rows(&self, spec: &QuerySpec) -> Vec<u32> {
+    /// Row indices matching `spec` — the segment-side predicate oracle: every
+    /// scan/count walk trusts these rows as exact matches. Uses the block
+    /// index to skip whole blocks. Returns empty if any required
+    /// label/numeric column is absent from the segment (mirrors
+    /// `QuerySpec::matches` semantics: absent ⇒ no match).
+    ///
+    /// `file` must be `Some` (the open segment file) when the spec carries
+    /// `text_like` and this segment's texts live in the file (v2) — LIKE is
+    /// verified against the raw text of every candidate, so this is the one
+    /// row-selection path that can touch the file (tallied into
+    /// `bytes_read`). Specs without `text_like` never read it.
+    pub fn matching_rows(
+        &self,
+        spec: &QuerySpec,
+        file: Option<&File>,
+        bytes_read: &AtomicU64,
+    ) -> Result<Vec<u32>> {
+        let Some(pattern) = &spec.text_like else {
+            return Ok(self.rows_by_columns(spec));
+        };
+        if self.texts.is_none() {
+            return Ok(Vec::new()); // no record here has text — LIKE can't match
+        }
+        let mut out = Vec::new();
+        for row in self.rows_by_columns(spec) {
+            if let Some(text) = self.text_at(row as usize, file, bytes_read)? {
+                if crate::text::like_match(pattern, &text) {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The column-resolvable predicates (everything except `text_like`):
+    /// fields via the block walk, `text_match` via the token postings index.
+    fn rows_by_columns(&self, spec: &QuerySpec) -> Vec<u32> {
         // Resolve label predicates against the columns.
         enum LReq<'a> {
             Code(&'a [u16], u16),
@@ -635,22 +668,36 @@ impl SegmentColumns {
                 read_at(f, off, len, bytes_read)?
             }
         };
-        let text = match &self.texts {
-            None => None,
-            Some(Texts::Mem(v)) => v[i].clone(),
+        let text = self.text_at(i, file, bytes_read)?;
+        Ok(self.build_record(i, payload, text))
+    }
+
+    /// Row `i`'s text (`None` = record has no text — honest absence). The
+    /// single text accessor: `materialize` and the `text_like` verifier both
+    /// resolve through it. `file` must be `Some` for file-sourced texts (v2).
+    fn text_at(
+        &self,
+        i: usize,
+        file: Option<&File>,
+        bytes_read: &AtomicU64,
+    ) -> Result<Option<String>> {
+        match &self.texts {
+            None => Ok(None),
+            Some(Texts::Mem(v)) => Ok(v[i].clone()),
             Some(Texts::File(ti)) => {
                 if ti.present[i] {
                     let f = file.ok_or_else(|| corrupt("text file handle missing"))?;
                     let off = ti.abs_base + ti.rel[i];
                     let len = (ti.rel[i + 1] - ti.rel[i]) as usize;
                     let bytes = read_at(f, off, len, bytes_read)?;
-                    Some(String::from_utf8(bytes).map_err(|_| corrupt("text not utf8"))?)
+                    Ok(Some(
+                        String::from_utf8(bytes).map_err(|_| corrupt("text not utf8"))?,
+                    ))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
-        };
-        Ok(self.build_record(i, payload, text))
+        }
     }
 
     fn build_record(&self, i: usize, payload: Vec<u8>, text: Option<String>) -> Record {
@@ -2166,11 +2213,17 @@ mod tests {
         let cols = read_columns(&path).unwrap();
         assert_eq!(cols.count(), 3);
         assert_eq!(cols.find_key("b"), Some(1));
-        let rows = cols.matching_rows(&QuerySpec {
-            labels: vec![("model".into(), "gpt-4o".into())],
-            numeric_ranges: vec![("latency_ms".into(), 25.0, 100.0)],
-            ..Default::default()
-        });
+        let rows = cols
+            .matching_rows(
+                &QuerySpec {
+                    labels: vec![("model".into(), "gpt-4o".into())],
+                    numeric_ranges: vec![("latency_ms".into(), 25.0, 100.0)],
+                    ..Default::default()
+                },
+                None,
+                &AtomicU64::new(0),
+            )
+            .unwrap();
         assert_eq!(rows, vec![2]); // only "c" (gpt-4o & latency 30)
         let rec = cols.materialize(2, None, &AtomicU64::new(0)).unwrap();
         assert_eq!(rec.key, "c");
@@ -2304,7 +2357,8 @@ mod tests {
                 .collect();
             oracle.sort();
             let mut got: Vec<String> = cols
-                .matching_rows(spec)
+                .matching_rows(spec, None, &AtomicU64::new(0))
+                .unwrap()
                 .iter()
                 .map(|&i| cols.key_at(i as usize).to_string())
                 .collect();
@@ -2337,10 +2391,16 @@ mod tests {
         ];
         write_segment(&path, &mut records).unwrap();
         let cols = read_columns(&path).unwrap();
-        let rows = cols.matching_rows(&QuerySpec {
-            numeric_ranges: vec![("x".into(), f64::MIN, f64::MAX)],
-            ..Default::default()
-        });
+        let rows = cols
+            .matching_rows(
+                &QuerySpec {
+                    numeric_ranges: vec![("x".into(), f64::MIN, f64::MAX)],
+                    ..Default::default()
+                },
+                None,
+                &AtomicU64::new(0),
+            )
+            .unwrap();
         assert_eq!(rows, vec![1]); // NaN row excluded, 5.0 row included
     }
 

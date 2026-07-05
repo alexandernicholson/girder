@@ -633,8 +633,8 @@ impl Girder {
         let disjoint = key_ranges_disjoint(&metas);
         let last = metas.len().saturating_sub(1);
         for (idx, meta) in metas.iter().enumerate() {
-            let (cols, _file) = self.load_segment(meta, spec.text_match.is_some())?;
-            for &row in &cols.matching_rows(spec) {
+            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
+            for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 if !seen.contains(cols.key_at(row as usize)) {
                     n += 1;
                 }
@@ -740,7 +740,9 @@ impl Girder {
         }
         for meta in self.pruned_segments(&stripped) {
             let (cols, file) = self.load_segment(&meta, false)?;
-            for &row in &cols.matching_rows(&stripped) {
+            for &row in
+                &cols.matching_rows(&stripped, file.as_ref(), &self.inner.stats_bytes_read)?
+            {
                 let record =
                     cols.materialize(row as usize, file.as_ref(), &self.inner.stats_bytes_read)?;
                 feed(&record);
@@ -813,7 +815,7 @@ impl Girder {
             // materialize loop, so a concurrent hot→cold rename can't tear the
             // per-row payload reads (the fd stays valid on unix).
             let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
-            let rows = cols.matching_rows(spec);
+            let rows = cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)?;
             if !rows.is_empty() {
                 for &row in &rows {
                     let r = row as usize;
@@ -921,8 +923,8 @@ impl Girder {
             }
             // Heap phase needs only the columns (keys/ts/order-numeric); the
             // file handle is reopened lazily for the surviving rows at drain.
-            let (cols, _file) = self.load_segment(meta, spec.text_match.is_some())?;
-            for &row in &cols.matching_rows(spec) {
+            let (cols, file) = self.load_segment(meta, spec.text_match.is_some())?;
+            for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 let r = row as usize;
                 let key = cols.key_at(r);
                 if seen.contains(key) {
@@ -1381,9 +1383,11 @@ fn text_query_tokens(spec: &QuerySpec) -> Option<Vec<String>> {
     spec.text_match.as_deref().map(crate::text::fts_tokens)
 }
 
-/// Memtable-phase matcher: field predicates via the oracle, text via the
-/// pre-intersected token-map candidate set (equal to the naive text check by
-/// construction — same tokenizer at insert; pinned by the agreement tests).
+/// Memtable-phase matcher: field predicates via the oracle, `text_match` via
+/// the pre-intersected token-map candidate set (equal to the naive text check
+/// by construction — same tokenizer at insert; pinned by the agreement
+/// tests), `text_like` always against the raw text (records are in memory —
+/// no token shortcut exists or is needed).
 fn mem_matches(
     spec: &QuerySpec,
     record: &Record,
@@ -1391,7 +1395,11 @@ fn mem_matches(
 ) -> bool {
     match cand {
         None => spec.matches(record),
-        Some(c) => c.contains(record.key.as_str()) && spec.matches_fields(record),
+        Some(c) => {
+            c.contains(record.key.as_str())
+                && spec.matches_fields(record)
+                && spec.text_like_ok(record)
+        }
     }
 }
 

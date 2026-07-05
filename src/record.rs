@@ -118,6 +118,14 @@ pub struct QuerySpec {
     /// matches. Served from the segment token index; [`QuerySpec::matches`]
     /// is the naive-scan oracle the index must agree with.
     pub text_match: Option<String>,
+    /// SQL `LIKE` predicate over `Record.text` (per
+    /// [`crate::text::like_match`]): `%` any run, `_` exactly one char,
+    /// case-sensitive, anchored both ends, no escape syntax. A record
+    /// without text never matches — absent is not empty, so even a bare
+    /// `'%'` misses text-less records. Composes with `text_match` by AND.
+    /// Evaluated exactly on every path (candidates are always verified
+    /// against the raw text; a token index only ever narrows).
+    pub text_like: Option<String>,
 }
 
 impl QuerySpec {
@@ -145,12 +153,26 @@ impl QuerySpec {
         if !self.matches_fields(record) {
             return false;
         }
-        match &self.text_match {
+        let fts_ok = match &self.text_match {
             None => true,
             Some(q) => {
                 let want = crate::text::fts_tokens(q);
                 crate::text::text_contains_all(record.text.as_deref(), &want)
             }
+        };
+        fts_ok && self.text_like_ok(record)
+    }
+
+    /// The `text_like` predicate alone (true when unset). Split out for
+    /// callers that pre-resolve `text_match` through a token structure but
+    /// still must verify LIKE against the raw text.
+    pub fn text_like_ok(&self, record: &Record) -> bool {
+        match &self.text_like {
+            None => true,
+            Some(p) => record
+                .text
+                .as_deref()
+                .is_some_and(|t| crate::text::like_match(p, t)),
         }
     }
 

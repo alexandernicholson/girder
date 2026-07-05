@@ -32,6 +32,42 @@ pub fn text_contains_all(text: Option<&str>, want: &[String]) -> bool {
     want.iter().all(|t| have.contains(t))
 }
 
+/// SQL `LIKE` matcher — Girder's implementation of the NORMATIVE spec defined
+/// in `rivet-core::filter::like_match` (rivet memory 0049): `%` = any run
+/// (incl. empty), `_` = exactly one char, all other chars literal.
+/// Case-sensitive, anchored both ends, no escape syntax (a literal `%`/`_`
+/// cannot be matched — documented v1 limitation). Same two-repos-one-spec
+/// exception as `fts_tokens`: the spec lives in rivet-core, this duplicate is
+/// pinned by `like_match_golden_fixtures` below (to be cross-pinned in
+/// rivet-core when the rivet-side pushdown wiring lands).
+pub fn like_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // Two-pointer wildcard match with backtracking to the last `%`.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern idx after %, text idx it consumed to)
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            // Let the last `%` swallow one more char and retry.
+            pi = sp;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +99,72 @@ mod tests {
             let got = fts_tokens(input);
             let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
             assert_eq!(&got, &want, "tokenizer drifted for {input:?}");
+        }
+    }
+
+    /// GOLDEN FIXTURES for `like_match` — the cross-repo pin for the SQL
+    /// LIKE spec (rivet-core `filter::like_match` is the normative oracle;
+    /// these vectors are to be duplicated there when the rivet-side pushdown
+    /// wiring lands). A drift here is a cross-repo contract break.
+    #[test]
+    fn like_match_golden_fixtures() {
+        let cases: &[(&str, &str, bool)] = &[
+            // Anchoring: both ends, always.
+            ("abc", "abc", true),
+            ("abc", "abcd", false),
+            ("abc", "xabc", false),
+            ("abc%", "abcd", true),
+            ("%abc", "xabc", true),
+            ("%abc%", "xxabcyy", true),
+            ("%abc%", "ab c", false),
+            // `%` matches the empty run.
+            ("%", "", true),
+            ("a%", "a", true),
+            ("%a", "a", true),
+            ("a%b", "ab", true),
+            ("a%b", "aXXb", true),
+            ("a%b", "aXbX", false),
+            // Empty pattern matches only empty text.
+            ("", "", true),
+            ("", "a", false),
+            // `_` is exactly one char (any char, including `%`-ish literals).
+            ("_", "a", true),
+            ("_", "", false),
+            ("_", "ab", false),
+            ("a_c", "abc", true),
+            ("a_c", "ac", false),
+            ("__", "ab", true),
+            ("_%", "a", true),
+            ("_%", "", false),
+            // Case-sensitive.
+            ("abc", "ABC", false),
+            ("ABC%", "abcdef", false),
+            ("Err%", "Error: boom", true),
+            ("err%", "Error: boom", false),
+            // No escapes: `%`/`_` in the PATTERN are always wildcards, and
+            // `%`/`_` in the TEXT are ordinary chars wildcards can consume.
+            ("100%", "100%", true), // the trailing % consumed a literal '%'
+            ("100_", "100%", true), // `_` consumed a literal '%'
+            ("1000", "100%", false),
+            // Unicode: `_` is one CHAR (scalar value), not one byte.
+            ("_stanbul", "İstanbul", true),
+            ("İst%", "İstanbul", true),
+            ("ΟΣ%", "ΟΣΑ", true),
+            ("οσ%", "ΟΣΑ", false), // case-sensitive: no folding
+            ("caf_", "café", true),
+            // Backtracking shapes.
+            ("%a%a%", "aa", true),
+            ("%a%a%", "a", false),
+            ("a%%b", "ab", true),
+            ("%%", "", true),
+            ("x%yz%", "xAAyzBByz", true),
+        ];
+        for (pattern, text, want) in cases {
+            assert_eq!(
+                like_match(pattern, text),
+                *want,
+                "like_match drifted for pattern={pattern:?} text={text:?}"
+            );
         }
     }
 }

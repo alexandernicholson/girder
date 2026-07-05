@@ -355,7 +355,10 @@ impl MaintenanceActor {
         //    (Output filenames are fresh, so this never deletes an output.)
         for meta in &run {
             std::fs::remove_file(segment_path(hot_dir, cold_dir, meta)).ok();
-            self.inner.cache.invalidate(meta.id);
+            // Hygiene only: sections are keyed by the never-reused file seq
+            // (`SegmentMeta::cache_key`), so a dead segment's entries can never
+            // be served for a live one — this just frees their bytes early.
+            self.inner.cache.invalidate(meta.cache_key());
         }
         self.inner
             .stats_compactions

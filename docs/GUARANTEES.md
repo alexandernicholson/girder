@@ -67,3 +67,12 @@ flush, compaction, tiering, retention). There is no lock choreography to get
 wrong — write order *is* the actor's mailbox order, and every read path
 (memtable → frozen, newest first → segments, newest-id-first) shadows older
 sources with a seen-key set.
+
+Background maintenance is **invisible to readers**: a `get`/`scan` never
+spuriously fails because a segment was compacted (files deleted) or tiered
+(file renamed) mid-read. Compaction deletes input files only after the
+replacement manifest is durably stored, so a read that raced the deletion
+retries against a fresh manifest snapshot; a tiering rename is tolerated by
+falling back to the other tier's path. `close()` quiesces all background
+work before returning, so manifest + files are always consistent for an
+immediate reopen.

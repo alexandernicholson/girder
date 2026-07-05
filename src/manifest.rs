@@ -25,6 +25,24 @@ pub struct SegmentMeta {
     pub created_unix_nanos: i64,
 }
 
+impl SegmentMeta {
+    /// Identity for cached sections: the never-reused filename sequence
+    /// number (`seg-{seq}.gird`, from `alloc_seq`).
+    ///
+    /// `meta.id` must NOT key the cache: compaction reuses the run's ids for
+    /// its outputs (recency positioning), so one id can name two different
+    /// on-disk section layouts over time — a stale cached section under a
+    /// reused id would serve wrong bytes. The filename seq is allocated fresh
+    /// for every physical file, so it is collision-free forever.
+    pub fn cache_key(&self) -> u64 {
+        self.file
+            .strip_prefix("seg-")
+            .and_then(|s| s.strip_suffix(".gird"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(self.id)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub next_segment_id: u64,

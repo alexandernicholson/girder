@@ -1175,3 +1175,83 @@ async fn scan_survives_concurrent_tiering() {
     // A point get from the cold tier still resolves.
     assert!(engine.get("s/00000000").await.unwrap().is_some());
 }
+
+/// Reads racing compaction must neither error (input files are deleted after
+/// the manifest swap — the reader retries on a fresh snapshot) nor serve
+/// stale bytes (compaction REUSES manifest ids for its outputs, so cached
+/// sections are keyed by the never-reused file seq, not the id). Regression
+/// test for the close/reopen `Io(NotFound)` caught by the upsert pinning
+/// suite: the same race fires on every compaction, not just at reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_survive_concurrent_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = GirderConfig::at(dir.path());
+    cfg.fsync = FsyncPolicy::EveryN(64);
+    cfg.memtable_max_records = 10_000; // manual flushes control segment count
+    cfg.compact_min_segments = 2; // compact as eagerly as possible
+    cfg.tick_interval = Duration::from_secs(3600);
+    let engine = std::sync::Arc::new(Girder::open(cfg).await.unwrap());
+
+    // The `record` helper's payload encodes the key, so any stale-section
+    // read is detectable by content.
+    let rec = |key: &str, ts: i64| record(key, ts, "gpt-4o", 1.0);
+
+    engine.put(rec("anchor", 1)).await.unwrap();
+    for i in 0..50 {
+        engine.put(rec(&format!("r/{i:04}"), i)).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compactor = {
+        let e = engine.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            // Keep creating fresh segments so every maintain() finds a run to
+            // merge — the anchor's segment is rewritten over and over.
+            for round in 0..30i64 {
+                for i in 0..20 {
+                    e.put(rec(&format!("w/{round:02}/{i:02}"), round * 100 + i))
+                        .await
+                        .unwrap();
+                }
+                e.flush().await.unwrap();
+                e.maintain().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+        })
+    };
+    let reader = {
+        let e = engine.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            let spec = QuerySpec {
+                key_prefix: Some("r/".into()),
+                ..Default::default()
+            };
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let got = e.get("anchor").await.unwrap().expect("anchor must exist");
+                assert_eq!(got.payload, b"payload-anchor", "stale bytes served");
+                let hits = e.scan(&spec).await.unwrap();
+                assert_eq!(hits.len(), 50, "r/ records lost under compaction");
+                for r in &hits {
+                    assert_eq!(
+                        r.payload,
+                        format!("payload-{}", r.key).into_bytes(),
+                        "stale section served for {}",
+                        r.key
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    compactor.await.unwrap();
+    reader.await.unwrap();
+    let stats = engine.stats();
+    assert!(
+        stats.compactions >= 10,
+        "compaction actually raced: {stats:?}"
+    );
+}

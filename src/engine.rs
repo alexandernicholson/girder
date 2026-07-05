@@ -303,6 +303,34 @@ impl Girder {
 
     /// Point lookup (newest wins across memtable → frozen → segments).
     pub async fn get(&self, key: &str) -> Result<Option<Record>> {
+        self.retry_vanished(|| self.get_once(key))
+    }
+
+    /// Bounded retry for reads that race a compaction's file deletion.
+    ///
+    /// Compaction removes its input files only AFTER the replacement manifest
+    /// is durably stored, so `Io(NotFound)` from a read means the manifest
+    /// snapshot the read was holding went stale mid-flight — a fresh snapshot
+    /// (the next attempt re-reads the manifest) cannot reference the deleted
+    /// file. NotFound that persists across retries means a file is missing
+    /// while still manifest-listed: real corruption, surfaced honestly.
+    fn retry_vanished<T>(&self, op: impl Fn() -> Result<T>) -> Result<T> {
+        const VANISHED_SEGMENT_RETRIES: usize = 4;
+        let mut attempt = 0;
+        loop {
+            match op() {
+                Err(GirderError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && attempt < VANISHED_SEGMENT_RETRIES =>
+                {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn get_once(&self, key: &str) -> Result<Option<Record>> {
         if let Some(record) = self.inner.memtable.read().unwrap().get(key) {
             return Ok(Some(record.clone()));
         }
@@ -345,12 +373,14 @@ impl Girder {
     /// of materializing every match, and — for `TimestampDesc` — stops early
     /// once no unvisited (older) segment can beat the weakest kept row.
     pub async fn scan(&self, spec: &QuerySpec) -> Result<Vec<Record>> {
-        if spec.limit > 0 {
-            if let Some(order) = &spec.order_by {
-                return self.scan_topk(spec, order);
+        self.retry_vanished(|| {
+            if spec.limit > 0 {
+                if let Some(order) = &spec.order_by {
+                    return self.scan_topk(spec, order);
+                }
             }
-        }
-        self.scan_full(spec)
+            self.scan_full(spec)
+        })
     }
 
     /// Materialize every match, dedupe newest-wins, sort by the effective
@@ -570,7 +600,9 @@ impl Girder {
         &self,
         meta: &crate::manifest::SegmentMeta,
     ) -> Result<(Arc<SegmentColumns>, Option<std::fs::File>)> {
-        let id = meta.id;
+        // Cache identity is the never-reused file seq, NOT `meta.id` —
+        // compaction reuses ids for its outputs (see SegmentMeta::cache_key).
+        let id = meta.cache_key();
         let cache = &self.inner.cache;
 
         // v1 legacy segments are not section-structured → cached as one bundle.
@@ -863,14 +895,20 @@ impl Girder {
     }
 
     /// Graceful shutdown: checkpoint everything to segments.
+    ///
+    /// Quiesces before returning: the tick source is stopped FIRST (no new
+    /// maintenance can be cast), then the final flush's maintenance `call`
+    /// drains the FIFO mailbox behind any already-queued `Tick` — so when
+    /// `close` returns, no background flush/compaction/tiering is in flight
+    /// and manifest + files are consistent for an immediate reopen.
     pub async fn close(self) -> Result<()> {
+        self._ticker.abort();
         self.flush().await?;
         self.writer
             .call(WriterMsg::Sync, CALL_TIMEOUT)
             .await
             .map_err(|_| GirderError::ShutDown)?
             .ok();
-        self._ticker.abort();
         Ok(())
     }
 }

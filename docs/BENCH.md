@@ -182,6 +182,24 @@ skips the text column when the caller doesn't verify text (`text_like`
 verification is the only reader). Neither engine-native leg regressed
 (D7/D8 1M tables above); the disk win stands.
 
+### 10M soak, omit_text (2026-07-06, seam sets `QuerySpec.omit_text` — rivet memory 0071)
+
+Same box, girder rev `990bbbb` resolved from the public remote, seam legs:
+
+| leg | D8 (regressed) | omit_text |
+|---|---|---|
+| recent ~1% (100k matched) | 1.08 s (+63%) | **637.75 ms — collapsed, below the pre-D8 662 ms baseline** |
+| selective ~0.25% | 6.86 s | 6.95 s (parity — never text-bound) |
+| fts matches ~0.1% | 8.61 s (+17%) | 8.60 s (UNCHANGED — see below) |
+| search box ~0.1% | 8.79 s (+15%) | 8.58 s (−2.4%) |
+| build (control) | 1320.8 s | 1509.8 s — writes untouched by design; this run's box was slower, so the read wins above are if anything understated |
+
+The `recent` collapse is the D12 prediction quantified: "100k inflates ≈
+the +0.4 s" — omit_text removed 0.44 s. And an honest negative: the
+fts-leg regressions did NOT move under omit_text, so they are NOT
+discarded-text costs — their cause lives elsewhere in D8's read path
+(handed to track D as a finding).
+
 The headline pair: at 1M spans the search box through the girder token
 index answers in **441 ms** where the naive in-RAM scan takes **7.97 s** —
 18× — and the engine itself serves the same query in **834 µs** when asked

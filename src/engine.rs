@@ -565,6 +565,89 @@ impl Girder {
         })
     }
 
+    /// Exact match COUNT for `spec`, without reading a single payload byte
+    /// (plan 0013 §7 D2c2): mirrors `scan_full`'s newest-wins walk — the
+    /// same `seen` seeding, the same per-source predicate checks over
+    /// columns only — and simply counts survivors instead of materializing
+    /// them. `count(spec) == scan(spec with limit 0).len()` is the pinned
+    /// oracle (`tests/count.rs`).
+    ///
+    /// - `spec.after` is rejected (a count is over the whole match set; a
+    ///   bounded-suffix count is undefined scope) and `limit`/`order_by`
+    ///   are ignored (they don't change membership).
+    /// - Counter deltas in range force the fold fallback (decode-heavy but
+    ///   exact) — raw delta rows must never be counted per-version.
+    /// - Records are counted as-matched: an embedder's tombstone convention
+    ///   excludes itself the same way it does from `scan` (e.g. a label
+    ///   predicate the tombstone lacks).
+    pub async fn count(&self, spec: &QuerySpec) -> Result<usize> {
+        if spec.after.is_some() {
+            return Err(GirderError::Config(
+                "count is over the whole match set; `after` is not meaningful".into(),
+            ));
+        }
+        let unbounded = QuerySpec {
+            limit: 0, // engine semantics: 0 = unlimited
+            order_by: None,
+            ..spec.clone()
+        };
+        self.retry_vanished(|| {
+            if self.deltas_possible(&unbounded) {
+                // Fold-first correctness over speed: partial values must
+                // never count, same rule as ranking.
+                return Ok(self.scan_fold(&unbounded)?.len());
+            }
+            self.count_full(&unbounded)
+        })
+    }
+
+    /// `scan_full` minus materialize: identical `seen` newest-wins walk,
+    /// counting instead of decoding. Any drift from `scan_full`'s shadowing
+    /// makes the count disagree with the page's own membership — the oracle
+    /// test holds them together.
+    fn count_full(&self, spec: &QuerySpec) -> Result<usize> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut n = 0usize;
+        let want = text_query_tokens(spec);
+        {
+            let memtable = self.inner.memtable.read().unwrap();
+            let cand = want.as_ref().map(|w| memtable.text_candidates(w));
+            for record in memtable.values() {
+                if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                    n += 1;
+                }
+            }
+        }
+        {
+            let frozen = self.inner.frozen.read().unwrap();
+            for (_, map) in frozen.iter().rev() {
+                let cand = want.as_ref().map(|w| map.text_candidates(w));
+                for record in map.values() {
+                    if seen.insert(record.key.clone()) && mem_matches(spec, record, cand.as_ref()) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        let metas = self.pruned_segments(spec);
+        let disjoint = key_ranges_disjoint(&metas);
+        let last = metas.len().saturating_sub(1);
+        for (idx, meta) in metas.iter().enumerate() {
+            let (cols, _file) = self.load_segment(meta, spec.text_match.is_some())?;
+            for &row in &cols.matching_rows(spec) {
+                if !seen.contains(cols.key_at(row as usize)) {
+                    n += 1;
+                }
+            }
+            if !disjoint && idx != last {
+                for i in 0..cols.count() {
+                    seen.insert(cols.key_at(i).to_string());
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// Any delta-flagged records among the sources this spec's key range can
     /// touch? Conservative superset: memtable/frozen delta presence, or a
     /// prefix-overlapping segment whose zone-map label set carries the

@@ -29,7 +29,20 @@ fn record(i: usize) -> Record {
         ]),
         numerics: BTreeMap::from([("latency_ms".to_string(), (i % 2000) as f64)]),
         payload: vec![7u8; 1200], // ~realistic span JSON size
-        text: None,
+        // FTS document (message-content stand-in). `zebracorn` marks ~0.1%
+        // of records — the selective FTS leg; the phrase pool gives common
+        // tokens for the broad leg.
+        text: Some(if i % 1000 == 0 {
+            format!("user asked about billing zebracorn case {i}")
+        } else {
+            [
+                "the quick brown fox jumps over the lazy dog",
+                "error database timeout retry exhausted",
+                "tool call search weather in paris",
+                "model replied politely about the invoice",
+            ][i % 4]
+                .to_string()
+        }),
     }
 }
 
@@ -245,6 +258,91 @@ fn main() {
             gets += 1;
         }
         println!("point gets (warm): {:.2?} / {gets}", start.elapsed());
+
+        // --- FTS (plan 0013 §6): the token index in the headline numbers. ---
+        // Selective: AND of a rare marker + a common token (~0.1% of rows).
+        let fts_selective = QuerySpec {
+            text_match: Some("zebracorn billing".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        // Broad: two common tokens (~25% of rows).
+        let fts_broad = QuerySpec {
+            text_match: Some("timeout database".into()),
+            limit: 50,
+            ..Default::default()
+        };
+        // Composed: FTS + label predicate.
+        let fts_composed = QuerySpec {
+            text_match: Some("zebracorn".into()),
+            labels: vec![("model".into(), "gpt-4o".into())],
+            limit: 50,
+            ..Default::default()
+        };
+        // Cold: a fresh engine (empty section cache) — the honest first-query
+        // cost of loading token postings sections.
+        let engine = {
+            drop(engine);
+            let mut config = GirderConfig::at(dir.path());
+            config.fsync = FsyncPolicy::EveryN(256);
+            config.memtable_max_records = 10_000;
+            config.compact_min_segments = 8;
+            config.tick_interval = Duration::from_secs(3600);
+            Girder::open(config).await.unwrap()
+        };
+        let reads_before = engine.stats().bytes_read;
+        let start = Instant::now();
+        let cold_hits = engine.scan(&fts_selective).await.unwrap().len();
+        let fts_cold = start.elapsed();
+        let fts_cold_read = engine.stats().bytes_read - reads_before;
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &fts_selective));
+        println!(
+            "fts selective ('zebracorn billing', ~0.1%)  cold={fts_cold:.2?} ({:.1} MB read)               warm_p50={p50:.2?}  ({hits} hits, limit 50; cold hits {cold_hits})",
+            mb(fts_cold_read)
+        );
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &fts_broad));
+        println!("fts broad ('timeout database', ~25%)       warm_p50={p50:.2?}  ({hits} hits, limit 50)");
+        let (p50, hits) = warm_p50(7, || runtime_block(&engine, &fts_composed));
+        println!("fts + label (composed)                     warm_p50={p50:.2?}  ({hits} hits, limit 50)");
+
+        // --- put-ack latency under load (the durability ack: WAL append +
+        // memtable insert, fsync/256), single puts, compaction racing. ---
+        let mut acks: Vec<Duration> = Vec::with_capacity(5_000);
+        for i in 0..5_000usize {
+            let r = record(n + i);
+            let start = Instant::now();
+            engine.put(r).await.unwrap();
+            acks.push(start.elapsed());
+            if (i + 1) % 1_000 == 0 {
+                engine.maintain().await.unwrap(); // compaction races the acks
+            }
+        }
+        acks.sort_unstable();
+        println!(
+            "put-ack (single puts, fsync/256, compaction racing): p50={:.2?}  p99={:.2?}  max={:.2?}",
+            acks[acks.len() / 2],
+            acks[acks.len() * 99 / 100],
+            acks[acks.len() - 1],
+        );
+
+        // --- flush lag under memtable pressure: burst 3x the memtable cap,
+        // then time how long the frozen queue takes to drain to durable
+        // segments (the freeze->flush pipeline, kicked automatically). ---
+        for b in 0..60 {
+            let chunk: Vec<Record> = (0..500).map(|i| record(n + 10_000 + b * 500 + i)).collect();
+            engine.put_batch(chunk).await.unwrap();
+        }
+        let start = Instant::now();
+        loop {
+            if engine.stats().frozen_memtables == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_micros(500)).await;
+        }
+        println!(
+            "flush lag (30k-record burst, 10k memtable): frozen queue drained in {:.2?}",
+            start.elapsed()
+        );
 
         let stats = engine.stats();
         println!(

@@ -95,24 +95,27 @@ lock choreography. Normative wording (including the explicit
 under crash) lives in [`docs/GUARANTEES.md`](docs/GUARANTEES.md), pinned by
 `tests/upsert_guarantee.rs`.
 
-## Numbers (release, laptop, **1M × ~1.3KB records**, columnar v2 engine)
+## Numbers (release, laptop, **1M × ~1.3 KB records + FTS text**, v2 + token index)
 
 | operation | result |
 |---|---|
-| durable build, 1M records (batch 500, fsync/256) | **7.15s (~140k rec/s)** |
-| selective scan, uncorrelated numeric (~0.25% match, limit 50) — warm | **~2.3ms** |
-| selective scan — cold | **13.1ms, reading 46.9MB** (columns + survivor payloads only; was 361ms / 1.19GB whole-file) |
-| broad filtered + sorted page (~17% match, top-k limit 50) — warm | **~2.5ms** |
-| newest-first page (`order_by` ts desc, limit 50) | **~1.2ms** (early termination: 1 segment loaded) |
-| recent time-range scan (~1% match) — warm | **~4.7ms** |
-| point get (warm) | ~3.5µs |
-| zone-map-pruned query (no match) | ~29µs |
+| durable build, 1M records (compaction racing, incl. K_TEXT/K_TOKENS) | **12.2 s (~82k rec/s)**, write-amp 1.63× |
+| **put-ack** (single put: WAL append + memtable fold, fsync/256) | **p50 36 µs · p99 70 µs** with compaction racing |
+| **flush lag** (30k-record burst / 10k memtable) | **9.75 ms** to fully durable |
+| **full-text search** (`zebracorn billing`, ~0.1%, limit 50) — warm | **834 µs** (postings intersection; cold first-touch 29.5 ms) |
+| **FTS + label predicate** (composed) — warm | **297 µs** |
+| selective numeric scan (~0.25%, limit 50) — warm / cold | **2.8 ms** / 19.8 ms (54.7 MB read) |
+| broad filtered + sorted page (~17%, top-k 50) — warm | **3.1 ms** |
+| newest-first page (`order_by` ts desc, limit 50) | **796 µs** (early termination) |
+| recent time-range scan (~1%) — warm | **8.3 ms** |
+| point get (warm) | ~5.5 µs |
+| zone-map-pruned query (no match) | ~7.7 µs |
 
-Pre-v2 baselines for the same shapes @1M: selective ~3.0s, broad ~4.75s,
-recent ~70ms — the v2 engine (columnar segments + block pruning + top-k
-pushdown + tiered compaction + section cache, `docs/PERF-PLAN.md`) is
-**~1,000–2,000× faster on the weak paths** without regressing the strong one.
-`stats.bytes_read` makes per-query I/O observable.
+Methodology, every leg's definition, and the un-ordered-scan caveat live in
+[`docs/BENCH.md`](docs/BENCH.md) — the first honest run there is the
+baseline later runs are regression-guarded against. Pre-v2 history: the v2
+engine (`docs/PERF-PLAN.md`) was ~1,000–2,000× faster than v1 on the weak
+paths; this table now also carries the FTS/counter-era numbers.
 
 Run them: `cargo bench` (set `GIRDER_BENCH_N` to change corpus size; default 1M).
 

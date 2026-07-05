@@ -157,6 +157,10 @@ pub enum MaintCall {
 
 pub struct MaintenanceActor {
     pub inner: Arc<EngineInner>,
+    /// Ticks seen so far — the blob-orphan sweep runs on every Nth
+    /// (`GirderConfig::blob_sweep_every_n_ticks`), starting at tick 0 so a
+    /// boot always sweeps kill residue promptly (D9, ruling D-7).
+    pub ticks: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -198,7 +202,15 @@ impl MaintenanceActor {
                 self.tier()?;
                 self.groom()?;
                 self.migrate()?;
-                self.sweep_blob_orphans();
+                // D9 (ruling D-7): the orphan sweep lists the whole blob dir
+                // under the manifest read lock — every Nth tick is plenty
+                // (orphans are rare kill residue). Tick 0 sweeps at boot.
+                let tick = self
+                    .ticks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if tick.is_multiple_of(self.inner.config.blob_sweep_every_n_ticks.max(1) as u64) {
+                    self.sweep_blob_orphans();
+                }
                 Ok(flushed)
             }
         }

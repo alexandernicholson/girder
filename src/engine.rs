@@ -54,6 +54,11 @@ pub struct GirderConfig {
     pub retention: Vec<(String, i64)>,
     /// Background maintenance cadence.
     pub tick_interval: Duration,
+    /// Run the blob-orphan sweep only on every Nth maintenance tick (D9):
+    /// the sweep lists the whole blob directory under the manifest read
+    /// lock, and orphans are rare kill residue — every tick was busywork.
+    /// Tick 0 (boot) always sweeps. 0 is clamped to 1 (sweep every tick).
+    pub blob_sweep_every_n_ticks: usize,
 }
 
 impl GirderConfig {
@@ -72,6 +77,7 @@ impl GirderConfig {
             retention_nanos: None,
             retention: Vec::new(),
             tick_interval: Duration::from_secs(5),
+            blob_sweep_every_n_ticks: 12,
         }
     }
 }
@@ -245,15 +251,22 @@ impl Girder {
             Arc::clone(&runtime),
             MaintenanceActor {
                 inner: Arc::clone(&inner),
+                ticks: Default::default(),
             },
         )
         .await;
 
         // Periodic maintenance tick (cast — lossy is fine, next tick retries).
+        // The timer starts one full interval AFTER open (`interval_at`), not
+        // immediately: the D9 tick counter's semantics ("tick 0 sweeps") must
+        // be deterministic for explicit `maintain()` callers — an immediate
+        // timer tick would race them for tick 0. Boot's first sweep therefore
+        // lands at +tick_interval (or the first explicit maintain).
         let tick_ref = maintenance.clone();
         let interval = inner.config.tick_interval;
         let ticker = tokio::spawn(async move {
-            let mut timer = tokio::time::interval(interval);
+            let mut timer =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;

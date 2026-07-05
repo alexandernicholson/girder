@@ -177,3 +177,40 @@ async fn concurrent_puts_dedup() {
         Some(b"contended content".as_slice())
     );
 }
+
+/// D9 (ruling D-7): the orphan sweep runs on every Nth maintenance tick —
+/// tick 0 (the first tick after boot) sweeps, ticks 1..N-1 skip, tick N
+/// sweeps again. Deterministic because the boot timer starts one interval
+/// late: explicit `maintain()` calls own the tick numbering here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_sweep_honors_the_tick_divider() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.blob_sweep_every_n_ticks = 3;
+    let engine = Girder::open(cfg).await.unwrap();
+
+    let orphan = |content: &[u8]| {
+        use sha2::{Digest as _, Sha256};
+        let hash = format!("{:x}", Sha256::digest(content));
+        let shard = dir.path().join("blobs").join(&hash[0..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join(&hash), content).unwrap();
+        dir.path().join("blobs").join(&hash[0..2]).join(hash)
+    };
+
+    // Tick 0: the boot sweep — removes the pre-existing orphan.
+    let first = orphan(b"residue one");
+    engine.maintain().await.unwrap();
+    assert!(!first.exists(), "tick 0 sweeps at boot");
+
+    // Ticks 1 and 2: within the divider window — the orphan survives.
+    let second = orphan(b"residue two");
+    engine.maintain().await.unwrap();
+    assert!(second.exists(), "tick 1 must not sweep (divider 3)");
+    engine.maintain().await.unwrap();
+    assert!(second.exists(), "tick 2 must not sweep (divider 3)");
+
+    // Tick 3: the divider fires again.
+    engine.maintain().await.unwrap();
+    assert!(!second.exists(), "tick 3 sweeps (divider 3)");
+}

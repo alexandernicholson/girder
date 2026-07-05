@@ -64,3 +64,42 @@ shape rivet's search-bench measures.
 The corpus now carries a text document on every record, so these numbers
 INCLUDE the cost of writing K_TEXT + K_TOKENS on every segment — the build
 throughput and write-amp above are the honest with-FTS figures.
+
+## The rivet-seam baselines (search-bench, 2026-07-05)
+
+Cross-store numbers measured through rivet's `SearchIndex` seam
+(`rivet-bench`, one backend per process; spans ≈ 3 KB incl. their FTS text):
+
+```bash
+cargo run -p rivet-bench --bin search-bench --release --features girder -- 1000000 --only girder
+# the 10M soak (TMPDIR must be real disk; ~40 GB transient):
+cargo run -p rivet-bench --bin search-bench --release --features girder -- 10000000 --only girder --iters 20
+```
+
+**Seam note:** these are NOT the engine-native numbers above. The rivet
+`SearchIndex::query` contract materializes the FULL match set (exact totals
++ contractual sort) before paging, so its latencies scale with match count;
+girder-native top-k (2.8 ms selective, 834 µs FTS at 1M) measures the
+engine. Both are honest; top-k pushdown through the rivet seam is the
+ledgered follow-up (D2-adjacent).
+
+| spans | backend | build | query | p50 |
+|---|---|---|---|---|
+| 1M | Girder | **105.9 s (~9.4k spans/s durable, prod 5 s ticks)** | selective ~0.25% | 299 ms |
+| 1M | Girder | | fts matches ~0.1% | 432 ms |
+| 1M | Girder | | search box ~0.1% | 441 ms |
+| 1M | MemoryIndex | 2.9 s (RAM) | fts matches ~0.1% | 1.29 s |
+| 1M | MemoryIndex | | search box ~0.1% (naive scan) | **7.97 s** |
+| **10M (soak)** | Girder | **1043.6 s — LINEAR ×10 vs 1M** (the byte-cap seal fix's proof) | selective ~0.25% (25k matched) | 6.59 s |
+| 10M | Girder | | recent ~1% | 662 ms |
+| 10M | Girder | | fts matches ~0.1% (10k matched) | 7.35 s |
+| 10M | Girder | | search box ~0.1% | 7.64 s |
+
+The headline pair: at 1M spans the search box through the girder token
+index answers in **441 ms** where the naive in-RAM scan takes **7.97 s** —
+18× — and the engine itself serves the same query in **834 µs** when asked
+top-k. The 10M build's exact ×10 linearity is the regression guard for the
+byte-cap seal (a record-count-only seal made this same build superlinear —
+1,135 segment writes for 1M records; see the `fat_record_compaction_converges`
+test). The broad (~17%) row is skipped above 2M spans, loudly, because the
+seam materializes full match sets.

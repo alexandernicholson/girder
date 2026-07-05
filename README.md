@@ -111,6 +111,12 @@ under crash) lives in [`docs/GUARANTEES.md`](docs/GUARANTEES.md), pinned by
 | point get (warm) | ~5.5 µs |
 | zone-map-pruned query (no match) | ~7.7 µs |
 
+At **10M spans** (the rivet-bench soak, ~3 KB spans incl. FTS text): durable
+build **1043.6 s — exactly ×10 the 1M build** (linear; the byte-cap seal's
+proof), search-box FTS 7.6 s through rivet's materialize-everything seam,
+recent-window 662 ms. At 1M the token index answers the search box in
+441 ms where a naive in-RAM scan takes 7.97 s.
+
 Methodology, every leg's definition, and the un-ordered-scan caveat live in
 [`docs/BENCH.md`](docs/BENCH.md) — the first honest run there is the
 baseline later runs are regression-guarded against. Pre-v2 history: the v2

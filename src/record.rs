@@ -126,6 +126,17 @@ pub struct QuerySpec {
     /// Evaluated exactly on every path (candidates are always verified
     /// against the raw text; a token index only ever narrows).
     pub text_like: Option<String>,
+    /// Projection: when true, returned records carry `text: None` even when
+    /// text IS stored — an EXPLICIT caller contract for callers that never
+    /// read text back (e.g. the rivet seam, which decodes spans from
+    /// `payload` and uses text only for indexing), skipping the per-row
+    /// text read + inflate at materialize. Text PREDICATES (`text_match`,
+    /// `text_like`) still evaluate exactly — verification reads are
+    /// internal and unaffected. Membership-neutral: `count()` ignores it,
+    /// and the honest-absence rule is preserved by explicitness (the field
+    /// name states the projection the caller asked for). `get()` is always
+    /// full-fidelity.
+    pub omit_text: bool,
 }
 
 impl QuerySpec {

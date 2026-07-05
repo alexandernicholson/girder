@@ -556,7 +556,8 @@ impl Girder {
         for meta in self.pruned_segments(&spec) {
             let (cols, file) = self.load_segment(&meta, false)?;
             if let Some(idx) = cols.find_key(key) {
-                let record = cols.materialize(idx, file.as_ref(), &self.inner.stats_bytes_read)?;
+                let record =
+                    cols.materialize(idx, file.as_ref(), &self.inner.stats_bytes_read, true)?;
                 if let Some(done) = fold(&mut pending, &record) {
                     return Ok(surface(done));
                 }
@@ -785,6 +786,12 @@ impl Girder {
             key_prefix: spec.key_prefix.clone(),
             ..Default::default()
         };
+        // The post-fold filter is `spec.matches`, which reads `record.text`
+        // for text predicates — so the fold must fetch text whenever a text
+        // predicate exists, even under `omit_text` (the projection then
+        // strips the OUTPUT, never the evaluation).
+        let fold_wants_text =
+            !spec.omit_text || spec.text_match.is_some() || spec.text_like.is_some();
         {
             let memtable = self.inner.memtable.read().unwrap();
             for record in memtable.values() {
@@ -808,8 +815,12 @@ impl Girder {
             for &row in
                 &cols.matching_rows(&stripped, file.as_ref(), &self.inner.stats_bytes_read)?
             {
-                let record =
-                    cols.materialize(row as usize, file.as_ref(), &self.inner.stats_bytes_read)?;
+                let record = cols.materialize(
+                    row as usize,
+                    file.as_ref(),
+                    &self.inner.stats_bytes_read,
+                    fold_wants_text,
+                )?;
                 feed(&record);
             }
         }
@@ -826,6 +837,7 @@ impl Girder {
         if spec.limit > 0 {
             out.truncate(spec.limit);
         }
+        strip_text_if_omitted(spec, &mut out);
         Ok(out)
     }
 
@@ -903,6 +915,7 @@ impl Girder {
                             r,
                             file.as_ref(),
                             &self.inner.stats_bytes_read,
+                            !spec.omit_text,
                         )?);
                     }
                 }
@@ -919,6 +932,7 @@ impl Girder {
         if spec.limit > 0 {
             out.truncate(spec.limit);
         }
+        strip_text_if_omitted(spec, &mut out);
         Ok(out)
     }
 
@@ -1057,10 +1071,16 @@ impl Girder {
                     row,
                 } => {
                     let file = self.open_payload_file(&plan.steps[meta_idx].meta, &cols)?;
-                    out.push(cols.materialize(row, file.as_ref(), &self.inner.stats_bytes_read)?);
+                    out.push(cols.materialize(
+                        row,
+                        file.as_ref(),
+                        &self.inner.stats_bytes_read,
+                        !spec.omit_text,
+                    )?);
                 }
             }
         }
+        strip_text_if_omitted(spec, &mut out);
         Ok(out)
     }
 
@@ -1601,6 +1621,19 @@ fn need_tokens(spec: &QuerySpec) -> bool {
             .text_like
             .as_deref()
             .is_some_and(|p| !crate::text::like_constraints(p).is_empty())
+}
+
+/// The `omit_text` projection's single output gate: rows sourced from the
+/// memtable/frozen clones (and fold outputs that needed text for their own
+/// predicate) still carry text — one pass strips them so a page is uniform
+/// (segment rows never read theirs in the first place; that skip is the
+/// win this projection exists for).
+fn strip_text_if_omitted(spec: &QuerySpec, out: &mut [Record]) {
+    if spec.omit_text {
+        for r in out.iter_mut() {
+            r.text = None;
+        }
+    }
 }
 
 /// Memtable-phase matcher: field predicates via the oracle, `text_match` via

@@ -960,11 +960,16 @@ impl SegmentColumns {
     /// Reconstruct a full `Record` for row `i`. `file` must be `Some` (the open
     /// segment file) when `payload_needs_file()` is true. Any payload read is
     /// tallied into `bytes_read` (WS4 per-query I/O accounting).
+    /// `want_text: false` is the `QuerySpec::omit_text` projection: the text
+    /// column is not touched (no read, no inflate) and the record carries
+    /// `text: None` by explicit caller contract. Write paths and `get()`
+    /// always pass `true`.
     pub fn materialize(
         &self,
         i: usize,
         file: Option<&File>,
         bytes_read: &AtomicU64,
+        want_text: bool,
     ) -> Result<Record> {
         let payload = match &self.payloads {
             Payloads::Mem(v) => v[i].clone(),
@@ -975,7 +980,11 @@ impl SegmentColumns {
                 read_at(f, off, len, bytes_read)?
             }
         };
-        let text = self.text_at(i, file, bytes_read)?;
+        let text = if want_text {
+            self.text_at(i, file, bytes_read)?
+        } else {
+            None
+        };
         Ok(self.build_record(i, payload, text))
     }
 
@@ -2797,7 +2806,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, vec![2]); // only "c" (gpt-4o & latency 30)
-        let rec = cols.materialize(2, None, &AtomicU64::new(0)).unwrap();
+        let rec = cols.materialize(2, None, &AtomicU64::new(0), true).unwrap();
         assert_eq!(rec.key, "c");
         assert_eq!(rec.payload, b"p-c");
 
@@ -3203,11 +3212,11 @@ mod tests {
         let cols = read_columns(&path).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let br = std::sync::atomic::AtomicU64::new(0);
-        let r1 = cols.materialize(1, Some(&file), &br).unwrap();
+        let r1 = cols.materialize(1, Some(&file), &br, true).unwrap();
         assert_eq!(r1.text.as_deref(), Some("Hello, World!"));
-        let r0 = cols.materialize(0, Some(&file), &br).unwrap();
+        let r0 = cols.materialize(0, Some(&file), &br, true).unwrap();
         assert_eq!(r0.text, None);
-        let r3 = cols.materialize(3, Some(&file), &br).unwrap();
+        let r3 = cols.materialize(3, Some(&file), &br, true).unwrap();
         assert_eq!(r3.text.as_deref(), Some(""));
     }
 

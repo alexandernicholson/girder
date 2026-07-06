@@ -634,7 +634,7 @@ impl Girder {
 
     /// Exact match COUNT for `spec`, without reading a single payload byte
     /// (plan 0013 §7 D2c2): mirrors `scan_full`'s newest-wins walk — the
-    /// same `seen` seeding, the same per-source predicate checks over
+    /// same shadow probing, the same per-source predicate checks over
     /// columns only — and simply counts survivors instead of materializing
     /// them. `count(spec) == scan(spec with limit 0).len()` is the pinned
     /// oracle (`tests/count.rs`).
@@ -705,26 +705,22 @@ impl Girder {
         // The same shared walk plan as `scan_full` — the count's membership
         // and the page's membership cannot disagree (the pinned oracle).
         let plan = self.walk_plan(spec);
-        let last = plan.steps.len().saturating_sub(1);
+        let mut probe = ShadowProbe::new(plan.steps.len());
         for (idx, step) in plan.steps.iter().enumerate() {
             if !step.visit {
-                let keys = self.load_segment_keys(&step.meta)?;
-                for i in 0..keys.count() {
-                    seen.insert(keys.key_at(i).to_string());
-                }
-                continue;
+                continue; // probe target only
             }
             let (cols, file) = self.load_segment(&step.meta, need_tokens(spec))?;
             for &row in &cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)? {
                 let r = row as usize;
-                if !seen.contains(cols.key_at(r)) && !cols.is_tombstone_at(r) {
-                    n += 1;
+                let key = cols.key_at(r);
+                if seen.contains(key) || cols.is_tombstone_at(r) {
+                    continue;
                 }
-            }
-            if plan.track_shadows && idx != last {
-                for i in 0..cols.count() {
-                    seen.insert(cols.key_at(i).to_string());
+                if plan.track_shadows && probe.shadowed(self, &plan.steps, idx, key)? {
+                    continue;
                 }
+                n += 1;
             }
         }
         Ok(n)
@@ -905,45 +901,39 @@ impl Girder {
         // When key ranges are pairwise disjoint (the compacted / append-only
         // common case) a key can live in at most one segment, so no
         // cross-segment shadow tracking is needed — only membership checks
-        // against the memtable/frozen seed. Otherwise every step of each
-        // non-final source folds its keys into `seen` — visit steps after
-        // emitting, shadow steps as their whole purpose — so a zone- or
-        // block-pruned newer version still shadows an older match.
+        // against the memtable/frozen seed. Otherwise each CANDIDATE probes
+        // the newer plan steps (visit and shadow alike) whose key range
+        // covers it — a zone- or block-pruned newer version still shadows an
+        // older match, and steps no candidate lands in are never read.
         let plan = self.walk_plan(spec);
-        let last = plan.steps.len().saturating_sub(1);
+        let mut probe = ShadowProbe::new(plan.steps.len());
         for (idx, step) in plan.steps.iter().enumerate() {
             if !step.visit {
-                let keys = self.load_segment_keys(&step.meta)?;
-                for i in 0..keys.count() {
-                    seen.insert(keys.key_at(i).to_string());
-                }
-                continue;
+                continue; // probe target only — read iff a candidate lands in range
             }
             // One open file handle is held across this segment's whole
             // materialize loop, so a concurrent hot→cold rename can't tear the
             // per-row payload reads (the fd stays valid on unix).
             let (cols, file) = self.load_segment(&step.meta, need_tokens(spec))?;
             let rows = cols.matching_rows(spec, file.as_ref(), &self.inner.stats_bytes_read)?;
-            if !rows.is_empty() {
-                for &row in &rows {
-                    let r = row as usize;
-                    if !seen.contains(cols.key_at(r)) && !cols.is_tombstone_at(r) {
-                        if !after_ok_cols(spec, cols.timestamp_at(r), cols.key_at(r)) {
-                            continue; // bound applies to the winning version
-                        }
-                        out.push(cols.materialize(
-                            r,
-                            file.as_ref(),
-                            &self.inner.stats_bytes_read,
-                            !spec.omit_text,
-                        )?);
-                    }
+            for &row in &rows {
+                let r = row as usize;
+                let key = cols.key_at(r);
+                if seen.contains(key) || cols.is_tombstone_at(r) {
+                    continue;
                 }
-            }
-            if plan.track_shadows && idx != last {
-                for i in 0..cols.count() {
-                    seen.insert(cols.key_at(i).to_string());
+                if plan.track_shadows && probe.shadowed(self, &plan.steps, idx, key)? {
+                    continue; // a newer version elsewhere shadows this one (LWW)
                 }
+                if !after_ok_cols(spec, cols.timestamp_at(r), key) {
+                    continue; // bound applies to the winning version
+                }
+                out.push(cols.materialize(
+                    r,
+                    file.as_ref(),
+                    &self.inner.stats_bytes_read,
+                    !spec.omit_text,
+                )?);
             }
         }
 
@@ -962,9 +952,9 @@ impl Girder {
     ///
     /// Dedupe borrows keys from the loaded columns for membership tests (no
     /// per-matching-row `String` clone) and only pays a clone when a candidate
-    /// actually enters the heap (bounded by `limit` + improvements). Segment
-    /// keys are recorded in `seen` only when key ranges overlap (rare after
-    /// append/compaction) so a block-pruned newer version still shadows.
+    /// actually enters the heap (bounded by `limit` + improvements). When key
+    /// ranges overlap (rare after append/compaction) each candidate probes the
+    /// newer plan steps so a block-pruned newer version still shadows.
     ///
     /// **Early-termination soundness (timestamp desc).** Segments are visited
     /// strictly newest-id first (write recency — required for newest-wins).
@@ -1030,11 +1020,12 @@ impl Girder {
 
         // Phase 2: the shared newest-wins walk plan (see `walk_plan`), with
         // suffix-max early termination over its visit steps. Breaking early
-        // skips the remaining (older) steps entirely — shadow steps included,
-        // soundly: a shadow read only ever protects against segments older
-        // than itself, which the break refuses to visit anyway.
+        // skips the remaining (older) steps entirely — soundly: probes only
+        // ever consult steps NEWER than the candidate, all of which precede
+        // the break point in the walk.
         let plan = self.walk_plan(spec);
         let suffix_max = suffix_max_ts(&plan.steps);
+        let mut probe = ShadowProbe::new(plan.steps.len());
         for (i, step) in plan.steps.iter().enumerate() {
             if early_term && heap.len() >= limit {
                 let worst_ts = heap.peek().unwrap().timestamp();
@@ -1043,11 +1034,7 @@ impl Girder {
                 }
             }
             if !step.visit {
-                let keys = self.load_segment_keys(&step.meta)?;
-                for r in 0..keys.count() {
-                    seen.insert(keys.key_at(r).to_string());
-                }
-                continue;
+                continue; // probe target only
             }
             // Heap phase needs only the columns (keys/ts/order-numeric); the
             // file handle is reopened lazily for the surviving rows at drain.
@@ -1056,13 +1043,16 @@ impl Girder {
                 let r = row as usize;
                 let key = cols.key_at(r);
                 if seen.contains(key) {
-                    continue; // shadowed by a newer source
+                    continue; // shadowed by memtable/frozen
                 }
                 if cols.is_tombstone_at(r) {
-                    continue; // deleted: never a candidate (still shadows below)
+                    continue; // deleted: never a candidate
+                }
+                if plan.track_shadows && probe.shadowed(self, &plan.steps, i, key)? {
+                    continue; // a newer version elsewhere shadows this one (LWW)
                 }
                 if !after_ok_cols(spec, cols.timestamp_at(r), key) {
-                    continue; // keyset bound: post-LWW (shadow check above)
+                    continue; // keyset bound: post-LWW (shadow checks above)
                 }
                 let num = numeric_name.and_then(|n| cols.numeric_at(n, r));
                 let prim = make_prim(order, cols.timestamp_at(r), num);
@@ -1071,11 +1061,6 @@ impl Girder {
                     meta_idx: i,
                     row: r,
                 });
-            }
-            if plan.track_shadows {
-                for r in 0..cols.count() {
-                    seen.insert(cols.key_at(r).to_string());
-                }
             }
         }
 
@@ -1124,8 +1109,9 @@ impl Girder {
     /// A `visit` step zone-matches the spec and is read fully. A shadow step
     /// (`visit == false`) CANNOT match, but key-overlaps an *older* visit
     /// step — a newer version of a key living there still shadows an older,
-    /// matching version (LWW), so the walk must fold its KEYS (never its
-    /// payloads) into the shadow set. Zone pruning alone would drop it and
+    /// matching version (LWW), so the walk keeps it as a PROBE TARGET: a
+    /// candidate emitted from an older step binary-searches its keys (never
+    /// its payloads). Zone pruning alone would drop it and
     /// resurrect the older version: that was the un-shadowing bug
     /// (`tests/lww_shadowing.rs` — tombstone AND label-changed-rewrite
     /// shapes both reproduce it).
@@ -1133,9 +1119,9 @@ impl Girder {
     /// `track_shadows == false` means the WHOLE plan's key ranges (visit ∪
     /// shadow — computing disjointness over the zone-filtered list only was
     /// part of the bug) are pairwise disjoint: a key lives in at most one
-    /// plan segment, shadow steps are dropped, and no per-segment `seen`
-    /// seeding is needed — the compacted-store fast path, byte-identical to
-    /// the historical walk.
+    /// plan segment, shadow steps are dropped, and no shadow probing is
+    /// needed — the compacted-store fast path, byte-identical to the
+    /// historical walk.
     fn walk_plan(&self, spec: &QuerySpec) -> WalkPlan {
         let mut steps: Vec<WalkStep> = {
             let manifest = self.inner.manifest.read().unwrap();
@@ -1676,6 +1662,53 @@ fn mem_matches(
     }
 }
 
+/// Pull-wise shadow probe over a walk plan (D-3): answers "does any plan
+/// step NEWER than `idx` contain `key`?" by binary-searching the
+/// sorted-unique key column of just the steps whose zone key range covers
+/// the key. Keys sections load lazily — at most once per query per step,
+/// through the same cached `load_segment_keys` path push-wise seeding used —
+/// and a step no candidate's key lands in is never read at all.
+///
+/// Soundness rests on the fold dispatch: `scan`/`count` route to `scan_fold`
+/// whenever `deltas_possible(spec)`, and that gate is conservative over key
+/// prefix alone — so on every path where a probe runs, every newer version
+/// of a candidate key is a non-delta (record or tombstone) and key
+/// membership alone decides suppression. Push-wise seeding relied on the
+/// same invariant; `tests/probe_fold_routing.rs` pins it.
+struct ShadowProbe {
+    keys: Vec<Option<SegKeys>>,
+}
+
+impl ShadowProbe {
+    fn new(steps: usize) -> Self {
+        ShadowProbe {
+            keys: (0..steps).map(|_| None).collect(),
+        }
+    }
+
+    /// Is `key` present in any plan step newer than `idx` (visit or shadow)?
+    fn shadowed(
+        &mut self,
+        engine: &Girder,
+        steps: &[WalkStep],
+        idx: usize,
+        key: &str,
+    ) -> Result<bool> {
+        for (j, step) in steps.iter().enumerate().take(idx) {
+            let zone = &step.meta.zone;
+            if zone.min_key.as_str() <= key && key <= zone.max_key.as_str() {
+                if self.keys[j].is_none() {
+                    self.keys[j] = Some(engine.load_segment_keys(&step.meta)?);
+                }
+                if self.keys[j].as_ref().unwrap().contains(key) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Column-side keyset-bound check (same semantics as
 /// `QuerySpec::after_bound_ok`, without materializing the row).
 fn after_ok_cols(spec: &QuerySpec, ts: i64, key: &str) -> bool {
@@ -1726,16 +1759,11 @@ enum SegKeys {
 }
 
 impl SegKeys {
-    fn count(&self) -> usize {
+    /// Binary search the sorted-unique key column (either shape).
+    fn contains(&self, key: &str) -> bool {
         match self {
-            SegKeys::Slim(k) => k.count(),
-            SegKeys::Whole(cols) => cols.count(),
-        }
-    }
-    fn key_at(&self, i: usize) -> &str {
-        match self {
-            SegKeys::Slim(k) => k.key_at(i),
-            SegKeys::Whole(cols) => cols.key_at(i),
+            SegKeys::Slim(k) => k.find(key).is_some(),
+            SegKeys::Whole(cols) => cols.find_key(key).is_some(),
         }
     }
 }

@@ -595,6 +595,9 @@ pub struct SegmentColumns {
 }
 
 impl SegmentColumns {
+    /// Row count. Production reads now go through `matching_rows` /
+    /// `find_key`; retained for the unit tests below.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn count(&self) -> usize {
         self.count
     }

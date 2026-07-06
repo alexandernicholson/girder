@@ -44,11 +44,12 @@ label-scoped, time-windowed or numeric-ranged `scan`/`count` never returns a
 key's older version when a newer version exists — even when that newer
 version itself matches nothing (a tombstone, or a rewrite whose label values
 changed). Mechanically: the three read paths share one **walk plan** —
-every segment whose key range overlaps the walk contributes its keys to the
-shadow set; zone-matching segments as full visits, zone-pruned ones as
-keys-only reads (payloads untouched); range-disjointness (computed over the
-full prefix-overlapping set) skips all shadow bookkeeping in the compacted
-common case. Pinned by `tests/lww_shadowing.rs`, which holds all three paths
+zone-matching segments are full visits, zone-pruned overlapping ones stay as
+probe targets; each candidate row binary-searches the sorted key column of
+every NEWER plan step whose key range covers it (keys only, payloads
+untouched — and a step no candidate lands in is never read at all);
+range-disjointness (computed over the full prefix-overlapping set) skips all
+shadow bookkeeping in the compacted common case. Pinned by `tests/lww_shadowing.rs`, which holds all three paths
 to a naive newest-write-wins oracle.
 
 ## Deletes (`delete`)

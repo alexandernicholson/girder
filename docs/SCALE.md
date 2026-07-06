@@ -125,6 +125,18 @@ the D7 cache-sizing question for remote latencies. Range-GET stays
 ledgered with its demand evidence: pull latency complaints on stores whose
 individual segments are large (fat-record shapes) — measured, not guessed.
 
+**Oversized entries — budget-plus-one, never refuse (lead addition).** A
+single segment may be LARGER than `pull_cache_bytes` — production carries a
+422 MB segment TODAY. The pull cache MUST still fetch it: evict everything
+else and hold the one oversized entry, rather than ever refusing a read (a
+refused fetch would fail a query for data that exists — unacceptable). So
+`pull_cache_bytes` bounds the *sum of resident entries when it can*, but a
+single entry is always admitted; the budget is a target, not a hard cap
+that can starve a legal read. (This mirrors the memory-side lesson that a
+hard cap on an unbounded single item is a footgun — the 422 MB segment
+OOMd a different path once already; the pull cache must not repeat it, and
+it fetches whole-segment so the resident set is explicit.)
+
 ### 3.5 Knobs
 
 - `hot_ttl_nanos` — exists (24h default); rivet passthrough landed (F-3a,
@@ -132,7 +144,31 @@ individual segments are large (fat-record shapes) — measured, not guessed.
 - `remote_ttl_nanos` — new; segments older than this age cold→remote.
   Only meaningful with an object store injected; `i64::MAX/2` idiom = never.
   Rivet passthrough: `--remote-ttl-hours`, same `open_tuned` shape.
-- `pull_cache_bytes` — new; bounds the pull-through cache directory.
+- `pull_cache_bytes` — new; bounds the pull-through cache directory
+  (budget-plus-one, per §3.4). Default = `cache_bytes`.
+
+**Age is the SEGMENT's age, and misconfiguration is safe (lead addition).**
+Both TTLs measure `created_unix_nanos` — the segment's own age, NOT how
+long it has sat in its current tier. So the thresholds are absolute points
+on one timeline. The mover only ever promotes a segment ONE tier per pass
+(hot→cold, then cold→remote), so `remote_ttl_nanos < hot_ttl_nanos` does
+NOT skip the cold hop: a segment already past both thresholds moves
+hot→cold on one tick and cold→remote on the next (the cold hop is never
+skipped — the mover reads the current tier and advances it by one). A
+segment younger than `remote_ttl_nanos` but past `hot_ttl_nanos` simply
+stops at cold until it ages further. There is no configuration that strands
+a segment or moves it backward.
+
+### 3.6 Security posture (lead addition)
+
+Remote objects carry FULL trace payloads. Encryption-at-rest and bucket
+access control are the DEPLOYMENT boundary: girder ships bytes to the store
+the operator names and trusts it to be private — self-host doctrine, the
+same boundary the rivet P2 compliance page draws for the local store.
+Girder adds no application-layer encryption of its own (the `ObjectStore`
+seam is opaque bytes in, opaque bytes out); an operator who needs
+encryption configures it on the bucket / SSE, exactly as they secure the
+local hot/cold disks today.
 
 ## 4. Cluster reads (rivet side): scatter-gather
 

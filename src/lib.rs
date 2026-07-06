@@ -40,6 +40,7 @@ mod engine;
 mod error;
 mod manifest;
 mod memtable;
+mod object_store;
 mod record;
 mod retention;
 mod segment;
@@ -48,6 +49,7 @@ mod wal;
 
 pub use engine::{Girder, GirderConfig, Stats};
 pub use error::{GirderError, Result};
+pub use object_store::{ObjectStore, ObjectStoreRef};
 pub use record::{OrderBy, QuerySpec, Record, TOMBSTONE_LABEL};
 pub use text::fts_tokens;
 pub use wal::FsyncPolicy;

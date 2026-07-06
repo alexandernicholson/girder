@@ -43,6 +43,20 @@ pub struct GirderConfig {
     pub max_segment_bytes: u64,
     /// Age (nanos) after which segments move to the cold tier.
     pub hot_ttl_nanos: i64,
+    /// Age (nanos) after which segments move to the REMOTE (object-storage)
+    /// tier, if an [`ObjectStore`] is injected (SCALE-1, docs/SCALE.md). Age is
+    /// the SEGMENT's age (`created_unix_nanos`), the same clock `hot_ttl` uses —
+    /// so a segment ages hot→cold→remote by crossing each threshold in turn.
+    /// Default `i64::MAX / 2` = never (byte-identical to a two-tier engine); a
+    /// value below `hot_ttl_nanos` just means the next tick after the cold move
+    /// also qualifies it for remote (hot→cold→remote across consecutive ticks;
+    /// the cold hop is never skipped — the mover only ever promotes one tier).
+    pub remote_ttl_nanos: i64,
+    /// Byte budget for the local pull-through cache of remote segments
+    /// (SCALE-1). A segment LARGER than this budget is still fetched — the
+    /// cache evicts everything else and holds the one oversized entry rather
+    /// than ever refusing a read (budget-plus-one-entry). Default = `cache_bytes`.
+    pub pull_cache_bytes: u64,
     /// Drop records older than this at compaction (None = keep forever).
     /// Legacy global knob — folds into `retention` as the `""` (match-all)
     /// row; an explicit `""` row in `retention` overrides it.
@@ -74,6 +88,8 @@ impl GirderConfig {
             max_segment_records: 128 * 1024,
             max_segment_bytes: 256 * 1024 * 1024,
             hot_ttl_nanos: 24 * 3600 * 1_000_000_000,
+            remote_ttl_nanos: i64::MAX / 2, // never, until an ObjectStore is injected
+            pull_cache_bytes: 256 * 1024 * 1024,
             retention_nanos: None,
             retention: Vec::new(),
             tick_interval: Duration::from_secs(5),

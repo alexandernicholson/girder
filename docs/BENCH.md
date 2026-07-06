@@ -219,3 +219,37 @@ reclaimer (`docs/GUARANTEES.md` §Sealed-segment reclamation,
 above survives overwrite-heavy workloads too. The broad (~17%) row is
 skipped above 2M spans, loudly, because the seam materializes full match
 sets.
+
+## Tuning: size `cache_bytes` to the workload (D-3/D7 close-out)
+
+The fts-leg chase (tracked as D-3/D7) ended in two findings, one code and
+one configuration:
+
+**Code (shipped, `906945b`):** the per-query shadow-seeding tax on
+interleaved stores is gone — candidate-driven probes replaced push-wise
+key seeding. At 300k spans through the rivet seam: fts matches
+20.94 ms → **1.65 ms** p50 (12.7×), search box 6.4×, selective 4.9×,
+broad **improved** 7.8%, recent par. The mechanism was pinned live by a
+stage instrument before the fix: seeding was 12.4–14.6 ms of a ~14 ms
+query, 200k keys/query.
+
+**Configuration (accept-and-document, ruled):** the residual fts cost
+under load is *generic section-cache pressure*, not a token-index defect.
+`GirderConfig.cache_bytes` (default 256 MiB) is one shared LRU over ALL
+decoded sections; when the working set exceeds it, token sections — the
+largest, hottest entries on FTS queries — reload and re-decode per query.
+Measured at 300k spans with a 16 MiB cache (the same eviction regime the
+default hits at multi-M scale): fts 104 ms baseline → 21 ms with a cache
+large enough to hold everything. Two alternatives were measured and
+rejected: a *dedicated token pool* is **falsified as a default** (an
+undersized pool — 8 MiB against an 18–24 MB demand — showed ZERO win: a
+sizing footgun), and *pinning tokens outside the LRU* (39 ms) is dominated
+by simply raising `cache_bytes`, which also fixes column-reload legs the
+pin can't touch (selective 44 → 27 ms).
+
+**The sizing rule:** for FTS-heavy workloads, set `cache_bytes` to hold
+the token index plus the hot columns. Token demand scales with the corpus
+(~18–24 MB at 300k spans of the bench shape ⇒ roughly ~160 MB at 2M,
+~800 MB at 10M). Historical honesty: the 10M fts numbers recorded around
+the D8 window (rivet memory 0070) were partly a 256 MiB-default artifact,
+not intrinsic index cost.

@@ -17,6 +17,10 @@ use crate::segment::ZoneMap;
 pub enum Tier {
     Hot,
     Cold,
+    /// Aged out to the injected object store (SCALE-1, docs/SCALE.md). The
+    /// segment's bytes live remotely under `file` as the object key; locally it
+    /// exists only transiently in the pull-through cache when a read fetches it.
+    Remote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,10 +64,14 @@ pub struct Manifest {
 }
 
 const MANIFEST_MAGIC: u32 = 0x4e41_4d47; // "GMAN"
-/// v1 = versioned header; v2 = + the `blobs` existence set (B4). The bump
-/// makes a pre-B4 binary FAIL CLOSED on a blobs-bearing manifest instead of
-/// silently rewriting it without the set (which would orphan every blob).
-const MANIFEST_VERSION: u32 = 2;
+/// v1 = versioned header; v2 = + the `blobs` existence set (B4); v3 = the
+/// `Tier::Remote` variant may appear (SCALE-1). Each bump makes an OLDER
+/// binary FAIL CLOSED on a manifest it can't fully understand rather than
+/// silently rewrite it — a pre-v3 binary reading a remote-bearing manifest
+/// would not know the segment's bytes live in the object store (it would treat
+/// `Tier::Remote` as an unknown enum and fail to decode), so refusing is the
+/// safe outcome (never a manifest that drops a remote segment's existence).
+const MANIFEST_VERSION: u32 = 3;
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest> {
@@ -110,11 +118,23 @@ impl Manifest {
     }
 }
 
-/// Resolve a segment's absolute path from its meta.
+/// Subdirectory of the hot dir holding the pull-through cache of remote
+/// segments (SCALE-1) — fast disk, transient, bounded by `pull_cache_bytes`.
+pub(crate) const PULL_SUBDIR: &str = "pull";
+
+/// Object-key prefix for tiered segments in the remote store (their filename,
+/// `seg-<seq>.gird`). Used to list-and-reconcile orphans at open.
+pub(crate) const SEGMENT_KEY_PREFIX: &str = "seg-";
+
+/// Resolve a segment's LOCAL path from its meta. For a `Tier::Remote` segment
+/// this is its pull-through cache location under the hot dir — the segment's
+/// bytes are fetched there on read; callers that resolve a remote path must
+/// have ensured the fetch first (see `open_segment_file`'s pull-through).
 pub fn segment_path(hot_dir: &Path, cold_dir: &Path, meta: &SegmentMeta) -> PathBuf {
     match meta.tier {
         Tier::Hot => hot_dir.join(&meta.file),
         Tier::Cold => cold_dir.join(&meta.file),
+        Tier::Remote => hot_dir.join(PULL_SUBDIR).join(&meta.file),
     }
 }
 

@@ -12,7 +12,7 @@ use rebar_core::runtime::Runtime;
 use crate::actors::{MaintCall, MaintenanceActor, WriterActor, WriterMsg};
 use crate::cache::SegmentCache;
 use crate::error::{GirderError, Result};
-use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier};
+use crate::manifest::{segment_path, Manifest, SegmentMeta, Tier, PULL_SUBDIR, SEGMENT_KEY_PREFIX};
 use crate::memtable::MemTable;
 use crate::record::{OrderBy, QuerySpec, Record};
 use crate::segment::{
@@ -109,6 +109,11 @@ pub struct EngineInner {
     pub frozen: RwLock<Vec<FrozenMemtable>>,
     pub manifest: RwLock<Manifest>,
     pub cache: SegmentCache,
+    /// The remote (object-storage) tier, if injected (SCALE-1). `None` ⇒ a
+    /// two-tier engine, byte-identical to before. Consulted by the tiering
+    /// mover (cold→remote), the segment-open pull-through, and the tier-aware
+    /// `drop_segment_file`; nothing else in the engine knows about remotes.
+    pub object_store: Option<crate::object_store::ObjectStoreRef>,
     pub initial_wal_seq: u64,
     manifest_path: PathBuf,
     pub stats_puts: AtomicU64,
@@ -148,6 +153,105 @@ impl EngineInner {
     pub fn note_put(&self) {
         self.stats_puts.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Tier-aware physical delete of a dropped segment (SCALE-1). Hot/Cold ⇒
+    /// remove the local file; Remote ⇒ delete the object (idempotent, so a
+    /// retried retention drop converges). Best-effort for local files (the
+    /// manifest is already the source of truth — a stray file is harmless
+    /// residue), but a remote delete error propagates: an undeleted object is a
+    /// storage leak worth surfacing, and it is safe to retry. Also clears any
+    /// pull-cache copy of a remote segment.
+    pub fn drop_segment_file(&self, meta: &SegmentMeta) -> Result<()> {
+        match meta.tier {
+            Tier::Hot | Tier::Cold => {
+                std::fs::remove_file(segment_path(
+                    &self.config.hot_dir,
+                    &self.config.cold_dir,
+                    meta,
+                ))
+                .ok();
+            }
+            Tier::Remote => {
+                if let Some(store) = &self.object_store {
+                    store.delete(&meta.file)?;
+                }
+                std::fs::remove_file(self.config.hot_dir.join(PULL_SUBDIR).join(&meta.file)).ok();
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch a remote segment into the pull-through cache and open it (SCALE-1).
+    /// A cache hit opens directly. On a miss the whole object is fetched, the
+    /// cache is pruned to `pull_cache_bytes` (evicting other entries by oldest
+    /// mtime), and the fetched bytes are written — a segment LARGER than the
+    /// budget is still admitted (budget-plus-one: evict everything else, hold
+    /// the one entry, never refuse a read). The fd is held for the whole read,
+    /// so a later eviction of this file is safe on unix (same argument as the
+    /// hot↔cold rename tolerance).
+    fn open_remote_segment(&self, meta: &SegmentMeta) -> Result<std::fs::File> {
+        let pull_dir = self.config.hot_dir.join(PULL_SUBDIR);
+        let path = pull_dir.join(&meta.file);
+        if let Ok(f) = std::fs::File::open(&path) {
+            return Ok(f);
+        }
+        let store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| GirderError::Corrupt {
+                what: "manifest",
+                detail: format!("remote segment {} but no object store injected", meta.file),
+            })?;
+        let bytes = store.get(&meta.file)?.ok_or_else(|| GirderError::Corrupt {
+            what: "segment",
+            detail: format!("remote object {} is missing", meta.file),
+        })?;
+        std::fs::create_dir_all(&pull_dir)?;
+        // Prune to make room BEFORE writing, holding room for the new entry
+        // even if it alone exceeds the budget (budget-plus-one).
+        self.prune_pull_cache(&pull_dir, &meta.file, bytes.len() as u64)?;
+        let tmp = pull_dir.join(format!("{}.tmp", meta.file));
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(std::fs::File::open(&path)?)
+    }
+
+    /// Evict pull-cache entries (oldest mtime first) until the resident bytes
+    /// plus `incoming` fit `pull_cache_bytes` — but NEVER evict `keep` (the
+    /// entry about to be written) and never refuse: if `incoming` alone exceeds
+    /// the budget, everything else is evicted and the one oversized entry is
+    /// still admitted (budget-plus-one, docs/SCALE.md §3.4).
+    fn prune_pull_cache(
+        &self,
+        pull_dir: &std::path::Path,
+        keep: &str,
+        incoming: u64,
+    ) -> Result<()> {
+        let budget = self.config.pull_cache_bytes;
+        let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(pull_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy() != keep)
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                if !m.is_file() {
+                    return None;
+                }
+                Some((m.modified().ok()?, m.len(), e.path()))
+            })
+            .collect();
+        let resident: u64 = entries.iter().map(|(_, len, _)| *len).sum();
+        // Oldest first — evict until resident + incoming <= budget (or empty).
+        entries.sort_by_key(|(mtime, _, _)| *mtime);
+        let mut freed = 0u64;
+        for (_, len, path) in entries {
+            if resident.saturating_sub(freed).saturating_add(incoming) <= budget {
+                break;
+            }
+            std::fs::remove_file(&path).ok();
+            freed += len;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,6 +261,8 @@ pub struct Stats {
     pub frozen_memtables: usize,
     pub hot_segments: usize,
     pub cold_segments: usize,
+    /// Segments aged out to the injected object store (SCALE-1).
+    pub remote_segments: usize,
     pub total_records_in_segments: usize,
     pub flushes: u64,
     pub compactions: u64,
@@ -198,10 +304,58 @@ impl Girder {
     /// Open (or create) an engine at `config.hot_dir`, recovering any WAL
     /// tail from a previous crash into a fresh segment.
     pub async fn open(config: GirderConfig) -> Result<Girder> {
+        Self::open_inner(config, None).await
+    }
+
+    /// `open` with a remote (object-storage) tier injected (SCALE-1,
+    /// docs/SCALE.md). Aged segments move cold→remote past `remote_ttl_nanos`
+    /// and are served back through a bounded local pull-through cache —
+    /// transparent to every query. Without a store the engine is two-tier and
+    /// byte-identical to `open`.
+    pub async fn open_with_object_store(
+        config: GirderConfig,
+        object_store: crate::object_store::ObjectStoreRef,
+    ) -> Result<Girder> {
+        Self::open_inner(config, Some(object_store)).await
+    }
+
+    async fn open_inner(
+        config: GirderConfig,
+        object_store: Option<crate::object_store::ObjectStoreRef>,
+    ) -> Result<Girder> {
         std::fs::create_dir_all(&config.hot_dir)?;
         std::fs::create_dir_all(&config.cold_dir)?;
         let manifest_path = config.hot_dir.join("MANIFEST");
         let manifest = Manifest::load(&manifest_path)?;
+
+        // SCALE-1: with a remote tier, the pull-through cache lives on fast
+        // disk under the hot dir, and any object NOT named by a live
+        // `Tier::Remote` entry is orphan residue of a crash mid retention-drop
+        // (manifest dropped first, object delete never ran) — reconcile it.
+        // Manifest-drop-first ordering guarantees the inverse (a manifest entry
+        // with no object) can't happen, so this direction is the only sweep.
+        if let Some(store) = &object_store {
+            std::fs::create_dir_all(config.hot_dir.join(PULL_SUBDIR))?;
+            let live: std::collections::HashSet<&str> = manifest
+                .segments
+                .iter()
+                .filter(|s| s.tier == Tier::Remote)
+                .map(|s| s.file.as_str())
+                .collect();
+            for key in store.list(SEGMENT_KEY_PREFIX)? {
+                if !live.contains(key.as_str()) {
+                    store.delete(&key)?;
+                }
+            }
+            // A crash after the manifest flip but before the local delete
+            // (tier_to_remote step 3) leaves a stale hot/cold copy of a now-remote
+            // segment. Reads already prefer the store, so it is harmless residue —
+            // reap it so it can't drift or waste disk.
+            for meta in manifest.segments.iter().filter(|s| s.tier == Tier::Remote) {
+                std::fs::remove_file(config.hot_dir.join(&meta.file)).ok();
+                std::fs::remove_file(config.cold_dir.join(&meta.file)).ok();
+            }
+        }
 
         // Recover: replay every leftover WAL (ascending seq) into the
         // memtable-to-be; they cover records that never reached a segment.
@@ -237,6 +391,7 @@ impl Girder {
             frozen: RwLock::new(Vec::new()),
             manifest: RwLock::new(manifest),
             cache: SegmentCache::new(config.cache_bytes),
+            object_store,
             initial_wal_seq: next_wal_seq,
             manifest_path,
             stats_puts: AtomicU64::new(0),
@@ -1541,15 +1696,23 @@ impl Girder {
     /// open, the handle is held for the segment's whole read (sections + payload
     /// slices), so an fd stays valid across a rename on unix.
     fn open_segment_file(&self, meta: &crate::manifest::SegmentMeta) -> Result<std::fs::File> {
+        // Remote (SCALE-1): fetch through the pull cache; the manifest snapshot
+        // the scan holds is authoritative about the tier here.
+        if meta.tier == Tier::Remote {
+            return self.inner.open_remote_segment(meta);
+        }
         let hot = &self.inner.config.hot_dir;
         let cold = &self.inner.config.cold_dir;
         let primary = segment_path(hot, cold, meta);
         match std::fs::File::open(&primary) {
             Ok(f) => Ok(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Tolerate a concurrent hot↔cold rename: try the other local
+                // tier. (A remote segment took the branch above.)
                 let other = match meta.tier {
                     Tier::Hot => cold.join(&meta.file),
                     Tier::Cold => hot.join(&meta.file),
+                    Tier::Remote => unreachable!("remote handled above"),
                 };
                 Ok(std::fs::File::open(other)?)
             }
@@ -1572,6 +1735,11 @@ impl Girder {
                 .segments
                 .iter()
                 .filter(|s| s.tier == Tier::Cold)
+                .count(),
+            remote_segments: manifest
+                .segments
+                .iter()
+                .filter(|s| s.tier == Tier::Remote)
                 .count(),
             total_records_in_segments: manifest.segments.iter().map(|s| s.zone.count).sum(),
             flushes: self.inner.stats_flushes.load(Ordering::Relaxed),

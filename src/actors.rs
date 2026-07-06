@@ -460,7 +460,7 @@ impl MaintenanceActor {
         // 7. Manifest is the source of truth → the old input files are garbage.
         //    (Output filenames are fresh, so this never deletes an output.)
         for meta in &run {
-            std::fs::remove_file(segment_path(hot_dir, cold_dir, meta)).ok();
+            self.inner.drop_segment_file(meta).ok();
             // Hygiene only: sections are keyed by the never-reused file seq
             // (`SegmentMeta::cache_key`), so a dead segment's entries can never
             // be served for a live one — this just frees their bytes early.
@@ -830,7 +830,7 @@ impl MaintenanceActor {
             manifest.segments.retain(|s| s.id != cand.id);
             self.inner.store_manifest(&manifest)?;
             drop(manifest);
-            std::fs::remove_file(&cand_path).ok();
+            self.inner.drop_segment_file(&cand).ok();
             self.inner.cache.invalidate(cand.cache_key());
         } else {
             let seq = self.alloc_seq();
@@ -1091,6 +1091,9 @@ impl MaintenanceActor {
             let dir = match meta.tier {
                 Tier::Hot => &self.inner.config.hot_dir,
                 Tier::Cold => &self.inner.config.cold_dir,
+                // Remote segments are modern (v2+) by construction and have no
+                // local dir to rewrite into — never a legacy-migration candidate.
+                Tier::Remote => continue,
             };
             let out_path = dir.join(&file);
             let zone = segment::write_segment_presorted(&out_path, &records)?;
@@ -1118,20 +1121,36 @@ impl MaintenanceActor {
         Ok(0)
     }
 
-    /// Move hot segments past `hot_ttl` to the cold tier.
+    /// Age segments down the tiers: hot→cold past `hot_ttl`, then (if a remote
+    /// store is injected) cold→remote past `remote_ttl` (SCALE-1). Both use the
+    /// segment's own age; the mover only ever advances a segment ONE tier per
+    /// pass, so `remote_ttl < hot_ttl` never skips the cold hop.
     fn tier(&self) -> Result<u64> {
-        let cutoff = now_nanos() - self.inner.config.hot_ttl_nanos;
-        let to_move: Vec<SegmentMeta> = {
+        let now = now_nanos();
+        let hot_cutoff = now - self.inner.config.hot_ttl_nanos;
+        // Segments already COLD at the start of this tick are the only remote
+        // candidates — a segment moved hot→cold below waits for the NEXT tick
+        // to go remote, so the cold hop is never skipped (docs/SCALE.md §3.5).
+        let already_cold: std::collections::HashSet<u64> = {
             let manifest = self.inner.manifest.read().unwrap();
             manifest
                 .segments
                 .iter()
-                .filter(|s| s.tier == Tier::Hot && s.created_unix_nanos < cutoff)
+                .filter(|s| s.tier == Tier::Cold)
+                .map(|s| s.id)
+                .collect()
+        };
+        let to_cold: Vec<SegmentMeta> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            manifest
+                .segments
+                .iter()
+                .filter(|s| s.tier == Tier::Hot && s.created_unix_nanos < hot_cutoff)
                 .cloned()
                 .collect()
         };
         let mut moved = 0;
-        for meta in to_move {
+        for meta in to_cold {
             let from = self.inner.config.hot_dir.join(&meta.file);
             let to = self.inner.config.cold_dir.join(&meta.file);
             // rename first (same fs); fall back to copy+remove (cross-fs).
@@ -1146,10 +1165,64 @@ impl MaintenanceActor {
             self.inner.store_manifest(&manifest)?;
             moved += 1;
         }
+        moved += self.tier_to_remote(now, &already_cold)?;
         if moved > 0 {
             self.inner
                 .stats_tiered
                 .fetch_add(moved, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(moved)
+    }
+
+    /// Cold→remote pass (SCALE-1). No-op without an injected store. The move
+    /// protocol is PUT → flip-manifest → delete-local, each step leaving the
+    /// segment readable in AT LEAST one place:
+    /// - crash after PUT, before flip: manifest still `Cold`, local file intact
+    ///   — reads unaffected; next tick re-PUTs (idempotent) and proceeds.
+    /// - crash after flip, before delete: manifest `Remote`, reads fetch from
+    ///   the store; the leftover cold file is orphan residue reaped at open.
+    ///
+    /// At no step is the segment readable in fewer than one place — the same
+    /// invariant the hot↔cold rename tolerance pins.
+    fn tier_to_remote(
+        &self,
+        now: i64,
+        already_cold: &std::collections::HashSet<u64>,
+    ) -> Result<u64> {
+        let Some(store) = self.inner.object_store.clone() else {
+            return Ok(0);
+        };
+        let cutoff = now - self.inner.config.remote_ttl_nanos;
+        let to_remote: Vec<SegmentMeta> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            manifest
+                .segments
+                .iter()
+                .filter(|s| {
+                    s.tier == Tier::Cold
+                        && already_cold.contains(&s.id)
+                        && s.created_unix_nanos < cutoff
+                })
+                .cloned()
+                .collect()
+        };
+        let mut moved = 0;
+        for meta in to_remote {
+            let local = self.inner.config.cold_dir.join(&meta.file);
+            let bytes = std::fs::read(&local)?;
+            // 1. PUT (idempotent — the key is the never-reused filename).
+            store.put(&meta.file, bytes)?;
+            // 2. Flip the manifest and persist BEFORE deleting the local file.
+            {
+                let mut manifest = self.inner.manifest.write().unwrap();
+                if let Some(entry) = manifest.segments.iter_mut().find(|s| s.id == meta.id) {
+                    entry.tier = Tier::Remote;
+                }
+                self.inner.store_manifest(&manifest)?;
+            }
+            // 3. Delete the local copy (best-effort; a leftover is reaped at open).
+            std::fs::remove_file(&local).ok();
+            moved += 1;
         }
         Ok(moved)
     }

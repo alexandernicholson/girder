@@ -168,9 +168,22 @@ reclaimed by a bounded background audit (`reclaim_sealed`, pinned by
   key columns only. A row is **dead** iff a strictly newer durable segment
   holds a non-delta record for its key and no newer durable segment holds
   a delta for it (a delta needs its base — the same fold rule compaction
-  and `count()` honor). A row is never judged by what sits *below* it, so
-  a tombstone-convention record shadowing older versions always survives
-  until it is itself shadowed.
+  and `count()` honor). A **live** row is never judged by what sits
+  *below* it, so a tombstone-convention record shadowing older versions
+  always survives until it is itself shadowed.
+- **The tombstone disjunct** (plan 0014 §1, ruling T1 — the one deliberate,
+  narrowly-scoped relaxation of the floor above, for first-class `del`
+  rows ONLY; pinned by `tests/tombstone_reclaim.rs`): a tombstone is
+  *also* dead iff no newer durable segment holds a delta for its key
+  (a tombstone is the base that terminates a delta chain) **and** no
+  strictly older durable segment's key column contains its key — it
+  shadows nothing and is shadowed by nothing, so dropping it changes no
+  read. Evidence completeness from durable segments alone holds by write
+  order (in-memory content for a durably-tombstoned key is always newer);
+  delta rows are key-column rows, so one membership test refuses both the
+  un-shadow and the fold-base hazards from below; older v1/unreadable
+  evidence is conservative (zone-range cover ⇒ the tombstone survives).
+  The floor for live records is unchanged and stays load-bearing.
 - A segment is rewritten (solo, same recency slot — never merged) only
   when at least **half** its rows are dead, so each rewrite at least
   halves it: bounded rewrites per segment lifetime, and an overwrite-free

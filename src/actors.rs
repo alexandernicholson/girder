@@ -582,9 +582,24 @@ impl MaintenanceActor {
     ///   delta for it (a delta needs its base to fold — the same rule
     ///   count()/compaction honor; ruling 8). Memtable/frozen shadowing is
     ///   ignored (durable-only, ruling 10): it lands as a segment soon and
-    ///   is seen then. A row is never dropped because of what sits BELOW
-    ///   it — so a tombstone-convention record shadowing older versions
-    ///   always survives until it is itself shadowed by a newer version.
+    ///   is seen then. A LIVE row is never dropped because of what sits
+    ///   BELOW it — so a tombstone-convention record shadowing older
+    ///   versions always survives until it is itself shadowed by a newer
+    ///   version.
+    /// - **The tombstone disjunct** (plan 0014 §1, ruling T1 — the one
+    ///   deliberate relaxation of the floor above, for FIRST-CLASS
+    ///   tombstones only): a `del` row is ALSO dead iff no newer durable
+    ///   segment holds a delta for its key (a tombstone is the base that
+    ///   terminates a delta chain — dropping it under a live chain would
+    ///   change folds) AND no strictly-OLDER durable segment's key column
+    ///   contains its key (delta rows are key-column rows, so an older
+    ///   delta that would un-shadow also refuses). Evidence completeness
+    ///   from durable segments alone holds by write order: memtable/frozen
+    ///   content for a durably-tombstoned key is always NEWER. Older v1 (or
+    ///   unreadable) evidence is conservative the other way: any zone-range
+    ///   cover marks the key as possibly-below and the tombstone survives.
+    ///   Once nothing shadows it and it shadows nothing, dropping it
+    ///   changes no membership answer on any read path.
     /// - **Rewrite only when `dead * 2 >= rows`** (f = 1/2, ruling 9 — the
     ///   same half-the-cap style as `byte_seal`): each rewrite at least
     ///   halves the segment, so one segment sees at most log2(rows) solo
@@ -612,7 +627,16 @@ impl MaintenanceActor {
         // NO newer overlapping segment are skipped from metadata alone (free
         // — no file touched); the tick's one audit goes to the first
         // candidate with actual evidence to read.
-        let Some((cand, newer)) = ({
+        // Does a zone say rows with `label` == "1" may exist in the segment?
+        // (`Some(None)` = the value set overflowed: assume yes.)
+        let zone_may_have = |m: &SegmentMeta, label: &str| -> bool {
+            match m.zone.labels.get(label) {
+                Some(Some(values)) => values.contains("1"),
+                Some(None) => true,
+                None => false,
+            }
+        };
+        let Some((cand, newer, older)) = ({
             let manifest = self.inner.manifest.read().unwrap();
             let mut sealed: Vec<&SegmentMeta> = manifest
                 .segments
@@ -634,11 +658,32 @@ impl MaintenanceActor {
                     })
                     .cloned()
                     .collect();
-                if newer.is_empty() {
-                    None // metadata-only skip: no row here can be dead
-                } else {
-                    Some(((*pick).clone(), newer))
+                // Metadata-only skip: with no newer overlap, no LIVE row
+                // here can be dead — but a first-class tombstone can (the
+                // tombstone disjunct judges by what's below), so a zone
+                // that may hold tombstones is still auditable.
+                if newer.is_empty() && !zone_may_have(pick, crate::record::TOMBSTONE_LABEL) {
+                    return None;
                 }
+                // Older overlapping evidence — the tombstone disjunct's
+                // below-set. Empty when the zone rules tombstones out
+                // (never read then).
+                let older: Vec<SegmentMeta> = if zone_may_have(pick, crate::record::TOMBSTONE_LABEL)
+                {
+                    manifest
+                        .segments
+                        .iter()
+                        .filter(|m| m.id < pick.id)
+                        .filter(|m| {
+                            m.zone.min_key <= pick.zone.max_key
+                                && pick.zone.min_key <= m.zone.max_key
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some(((*pick).clone(), newer, older))
             })
         }) else {
             return Ok(0);
@@ -676,12 +721,7 @@ impl MaintenanceActor {
             }
             let dir = segment::read_footer(&file, &scratch)?;
             let nkeys = segment::load_keys(&file, &dir, &scratch)?;
-            let deltas_possible = match meta.zone.labels.get(crate::record::DELTA_LABEL) {
-                Some(Some(values)) => values.contains("1"),
-                Some(None) => true,
-                None => false,
-            };
-            let delta_col = if deltas_possible {
+            let delta_col = if zone_may_have(meta, crate::record::DELTA_LABEL) {
                 Some(segment::load_label(
                     &file,
                     &dir,
@@ -691,18 +731,8 @@ impl MaintenanceActor {
             } else {
                 None
             };
-            let row_is_delta = |j: usize| -> bool {
-                match &delta_col {
-                    None => false,
-                    Some(segment::LabelColumn::Dict { dict, codes, .. }) => {
-                        let c = codes[j];
-                        c != 0 && dict[(c - 1) as usize] == "1"
-                    }
-                    Some(segment::LabelColumn::Plain { values }) => {
-                        values[j].as_deref() == Some("1")
-                    }
-                }
-            };
+            let row_is_delta =
+                |j: usize| -> bool { delta_col.as_ref().is_some_and(|col| label_is_one(col, j)) };
             for i in 0..total {
                 if shadowed[i] && delta_over[i] {
                     continue; // both facts known; nothing can change
@@ -716,7 +746,68 @@ impl MaintenanceActor {
                 }
             }
         }
-        let dead: Vec<bool> = (0..total).map(|i| shadowed[i] && !delta_over[i]).collect();
+
+        // The tombstone disjunct (see the dead-rule doc above): a candidate
+        // `del` row with no newer delta and NOTHING below is dead too. The
+        // below-evidence reads older overlapping key columns lazily — only
+        // segments some still-in-doubt tombstone's key zone-range lands in,
+        // and only when the candidate zone says tombstones may exist at all.
+        let mut tomb_dead = vec![false; total];
+        if zone_may_have(&cand, crate::record::TOMBSTONE_LABEL) {
+            let tomb_col = segment::load_label(
+                &cand_file,
+                &cand_dir,
+                crate::record::TOMBSTONE_LABEL,
+                &scratch,
+            )?;
+            let tomb: Vec<bool> = (0..total).map(|i| label_is_one(&tomb_col, i)).collect();
+            if tomb.iter().any(|t| *t) {
+                // below[i]: some strictly-older durable segment holds the
+                // key. Records, deltas and older tombstones alike — all are
+                // key-column rows, so one membership test refuses both the
+                // un-shadow hazard and the delta-base hazard from below.
+                let mut below = vec![false; total];
+                for meta in &older {
+                    let needs: Vec<usize> = (0..total)
+                        .filter(|&i| tomb[i] && !below[i])
+                        .filter(|&i| {
+                            let k = keys.key_at(i);
+                            meta.zone.min_key.as_str() <= k && k <= meta.zone.max_key.as_str()
+                        })
+                        .collect();
+                    if needs.is_empty() {
+                        continue; // zone-range pruned: no key column read
+                    }
+                    let path = segment_path(hot_dir, cold_dir, meta);
+                    let file = std::fs::File::open(&path)?;
+                    if segment::read_header(&file, &scratch)? != 2 {
+                        // v1 evidence unreadable — conservative the SAFE
+                        // way: a zone-range cover counts as possibly-below,
+                        // the tombstone survives (undercounting dead only
+                        // delays reclaim; the mirror of the newer-side v1
+                        // rule).
+                        for i in needs {
+                            below[i] = true;
+                        }
+                        continue;
+                    }
+                    let odir = segment::read_footer(&file, &scratch)?;
+                    let okeys = segment::load_keys(&file, &odir, &scratch)?;
+                    for i in needs {
+                        if okeys.find(keys.key_at(i)).is_some() {
+                            below[i] = true;
+                        }
+                    }
+                }
+                for i in 0..total {
+                    tomb_dead[i] = tomb[i] && !delta_over[i] && !below[i];
+                }
+            }
+        }
+
+        let dead: Vec<bool> = (0..total)
+            .map(|i| (shadowed[i] && !delta_over[i]) || tomb_dead[i])
+            .collect();
         let dead_count = dead.iter().filter(|d| **d).count();
         if dead_count * 2 < total {
             return Ok(0); // below f = 1/2 — not worth a rewrite yet
@@ -1074,6 +1165,18 @@ pub fn now_nanos() -> i64 {
 /// Segment filename for a (never-reused) sequence number.
 fn seg_file(seq: u64) -> String {
     format!("seg-{seq:016}.gird")
+}
+
+/// Is a label column's value at row `j` the flag "1"? (The delta and
+/// tombstone labels share this encoding — reclaim's evidence reads.)
+fn label_is_one(col: &segment::LabelColumn, j: usize) -> bool {
+    match col {
+        segment::LabelColumn::Dict { dict, codes, .. } => {
+            let c = codes[j];
+            c != 0 && dict[(c - 1) as usize] == "1"
+        }
+        segment::LabelColumn::Plain { values } => values[j].as_deref() == Some("1"),
+    }
 }
 
 /// Approximate on-disk footprint of one record, for byte-cap splitting. The

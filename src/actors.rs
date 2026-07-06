@@ -153,6 +153,10 @@ pub enum MaintCall {
     FlushPending,
     /// One compaction + tiering + retention pass.
     Tick,
+    /// Targeted compaction (D-3 heal): rewrite every segment whose zone
+    /// contains `key`, physically dropping that key from the outputs. See
+    /// [`crate::Girder::purge_key`] for the soundness constraints.
+    PurgeKey(String),
 }
 
 pub struct MaintenanceActor {
@@ -195,6 +199,7 @@ impl MaintenanceActor {
     fn run(&self, msg: MaintCall) -> Result<u64> {
         match msg {
             MaintCall::FlushPending => self.flush_pending(),
+            MaintCall::PurgeKey(key) => self.purge_key(&key),
             MaintCall::Tick => {
                 let flushed = self.flush_pending()?;
                 self.compact()?;
@@ -295,10 +300,7 @@ impl MaintenanceActor {
     /// Because adjacent ids ⇒ adjacent time ranges, merged zone maps stay tight
     /// and `recent` pruning holds by construction, not scheduling luck.
     fn compact(&self) -> Result<u64> {
-        let hot_dir = &self.inner.config.hot_dir;
-        let cold_dir = &self.inner.config.cold_dir;
-
-        // 1. Pick a run under the read lock, then release it for the merge I/O.
+        // Pick a run under the read lock, then release it for the merge I/O.
         let run: Vec<SegmentMeta> = {
             let manifest = self.inner.manifest.read().unwrap();
             match self.choose_run(&manifest.segments) {
@@ -306,6 +308,52 @@ impl MaintenanceActor {
                 None => return Ok(0),
             }
         };
+        self.compact_run(run, None)
+    }
+
+    /// The D-3 heal (`Girder::purge_key` documents the caller contract):
+    /// rewrite exactly the segments whose zone key range CONTAINS `key`,
+    /// dropping the key — record and tombstone alike — from the outputs, so
+    /// its poison leaves the zone maps. Sound because every containing
+    /// segment is in the run and the caller flushed the memtable first (no
+    /// older version left anywhere to un-shadow). Refuses delta-flagged
+    /// keys: a partial fold must never be materialized as a base. Kill-safe
+    /// like any compaction: one atomic manifest swap, idempotent re-run.
+    fn purge_key(&self, key: &str) -> Result<u64> {
+        let run: Vec<SegmentMeta> = {
+            let manifest = self.inner.manifest.read().unwrap();
+            manifest
+                .segments
+                .iter()
+                .filter(|m| m.zone.min_key.as_str() <= key && key <= m.zone.max_key.as_str())
+                .cloned()
+                .collect()
+        };
+        if run.is_empty() {
+            return Ok(0); // nothing anywhere could hold the key
+        }
+        let hot_dir = &self.inner.config.hot_dir;
+        let cold_dir = &self.inner.config.cold_dir;
+        for meta in &run {
+            let path = segment_path(hot_dir, cold_dir, meta);
+            for record in segment::read_all_records(&path)? {
+                if record.key == key && record.is_delta() {
+                    return Err(crate::GirderError::Config(
+                        "purge_key refuses counter (delta-flagged) keys".into(),
+                    ));
+                }
+            }
+        }
+        self.compact_run(run, Some(key))
+    }
+
+    /// Merge `run` newest-wins into fresh size-capped segments and swap the
+    /// manifest atomically — the shared body of `compact` (run chosen by
+    /// policy, no purge) and `purge_key` (run = zone-containing segments,
+    /// `purge` dropped from the output).
+    fn compact_run(&self, run: Vec<SegmentMeta>, purge: Option<&str>) -> Result<u64> {
+        let hot_dir = &self.inner.config.hot_dir;
+        let cold_dir = &self.inner.config.cold_dir;
         let run_ids: Vec<u64> = run.iter().map(|m| m.id).collect();
 
         // 2. Merge newest-wins: read ascending by id; later inserts overwrite.
@@ -338,6 +386,11 @@ impl MaintenanceActor {
                 Some(cutoff) => r.timestamp >= cutoff,
                 None => true, // no matching row: keep forever
             });
+        }
+        if let Some(key) = purge {
+            // The purge: physically drop the key — record AND tombstone —
+            // so the rewritten zones no longer carry its range/time poison.
+            merged.remove(key);
         }
         let records: Vec<Record> = merged.into_values().collect();
 

@@ -459,6 +459,26 @@ impl Girder {
         Ok(())
     }
 
+    /// Physically remove `key` from the store — record, tombstone AND its
+    /// zone-map footprint (D-3 heal). Flushes first so no version hides in
+    /// the memtable, then rewrites exactly the segments whose zones contain
+    /// the key (one atomic manifest swap; idempotent; kill-safe). Refuses
+    /// counter (delta-flagged) keys — a partial fold must never be
+    /// materialized as a base. Built for META keys that leaked into a
+    /// zone-mapped data keyspace and poisoned its pruning (a key range or
+    /// wall-clock timestamp spanning everything); see docs/COMPAT.md —
+    /// "never mix meta keys into a zone-mapped data keyspace".
+    pub async fn purge_key(&self, key: impl Into<String>) -> Result<()> {
+        self.flush().await?;
+        let maintenance = self.maintenance.lock().unwrap().clone();
+        maintenance
+            .call(MaintCall::PurgeKey(key.into()), CALL_TIMEOUT)
+            .await
+            .map_err(|_| GirderError::ShutDown)?
+            .map_err(GirderError::Encode)?;
+        Ok(())
+    }
+
     /// Run one compaction/tiering pass now (tests, ops).
     pub async fn maintain(&self) -> Result<()> {
         let maintenance = self.maintenance.lock().unwrap().clone();

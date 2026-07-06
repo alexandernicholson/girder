@@ -76,6 +76,19 @@ Pinned by `actors::tests::migration_converges_and_survives_kill`, which
 fabricates a full pre-versioning store — v1 segments, v0 manifest, a
 kill-mid-rewrite orphan — and drives it to convergence across restarts.
 
+**Never mix meta keys into a zone-mapped data keyspace.** A single meta
+record sharing a data store's memtable poisons the zone maps of every
+segment its flush and descendants touch: a key outside the data prefix
+widens the segment's key range until nothing is pairwise-disjoint (the
+G5 walk then seeds every visited key on every scan), and a wall-clock
+timestamp widens its time range until no window can prune it (measured:
+the D-3 marker cost ~0.8 s per query at 2M keys). Markers and sentinels
+belong in the blob namespace (outside segments and zone maps entirely) or
+in a separate engine. For stores already poisoned, `Girder::purge_key`
+is the heal: a targeted compaction that rewrites exactly the containing
+segments and physically drops the key (kill-safe, idempotent, refuses
+counter keys).
+
 Rivet-side control-plane *namespace* versioning (per-namespace schema
 versions inside payloads) is a separate concern — this document covers the
 engine's own container formats only. The first instance lives in rivet

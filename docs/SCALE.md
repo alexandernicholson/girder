@@ -229,6 +229,18 @@ designed here, landed in a track-f slice, track-e named reviewer):
 - **Range-GET section reads** — §3.4; trigger: pull-latency complaints on
   fat-segment stores.
 - **Trace→node hint gossip** — §4; trigger: same as shard routing.
+- **Cluster-wide delete fan-out** (added by the SCALE-4 activation slice,
+  rivet plan 0015) — deletes/retention stay owner-local; a delete of a
+  remote trace honestly no-ops. A fanned delete is a WRITE on the trust
+  bus; trigger: operator demand, with its own review.
+- **Partial-aggregate honesty surfacing** (rivet plan 0015) — a missing
+  peer during an aggregate fold is warned, not surfaced in
+  `AggregationResult` (pages already carry it via `total: None`); trigger:
+  UI wanting to render "N of M nodes" on metrics.
+- **Cluster-wide monitor semantics** (rivet plan 0015) — monitors read
+  their node-local index by design (fan-out would fire duplicates per
+  node; local-only under-fires split thresholds); trigger: duplicate- or
+  under-firing reports from a real cluster deploy.
 
 ## 7. Slice plan
 
@@ -245,6 +257,17 @@ designed here, landed in a track-f slice, track-e named reviewer):
    (track-e reviews) + `ClusterQuery` scatter-gather impl + merge tests
    (sort-contract merge, keyset resume across nodes, partial-failure
    honesty, (sum,count) aggregate folding).
+4. **SCALE-4 (rivet, plan 0015 — SHIPPED):** the CLI activation slice.
+   `ClusterStore` (TraceStore reads: detail/digest-batch/feedback
+   first-Some-or-union) + the `store-read` wire kind pair + the
+   `LateBoundTransport` arm-after-serve indirection (breaks the
+   ApiState↔node construction cycle without touching launch order) + the
+   §4 reads made page-correct (offset fan rewrite) and delete-safe +
+   aggregate folded via foldable partials (exact NumStats/multiset merge,
+   not (sum,count)-only — percentiles stay exact) + announcement-learned
+   peer registration (one-directional seeding fans both ways) + the
+   two-process LAUNCH harness (peerless-parity control, cross-node truth,
+   kill-a-peer honesty) in rivet-cli.
 
 Each slice gates independently; SCALE-1 is useful alone (single node,
 bottomless history on cheap storage), SCALE-3 is useful without SCALE-1
